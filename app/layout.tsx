@@ -6,7 +6,7 @@ const geist = Geist({ variable: "--font-sans", subsets: ["latin"] });
 const mono = Geist_Mono({ variable: "--font-mono", subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://banker-ready-dcf.sites.openai.com"),
+  metadataBase: new URL("https://banker-ready-dcf.chatur-val.chatgpt.site"),
   title: "Banker Ready DCF",
   description: "A filing-led, provenance-first public-equity DCF engine.",
   icons: { icon: "/favicon.svg", shortcut: "/favicon.svg" },
