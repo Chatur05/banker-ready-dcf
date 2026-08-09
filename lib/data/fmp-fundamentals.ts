@@ -137,9 +137,9 @@ function buildPeriod(
 export async function loadFmpFundamentals(ticker: string): Promise<SecBundle> {
   const [profilePayload, annualIncomePayload, annualBalancePayload, annualCashPayload, quarterIncomePayload, quarterBalancePayload, quarterCashPayload] = await Promise.all([
     fetchFmp<unknown>("/profile", { symbol: ticker }),
-    fetchFmp<unknown>("/income-statement", { symbol: ticker, period: "annual", limit: "6" }),
-    fetchFmp<unknown>("/balance-sheet-statement", { symbol: ticker, period: "annual", limit: "6" }),
-    fetchFmp<unknown>("/cash-flow-statement", { symbol: ticker, period: "annual", limit: "6" }),
+    fetchFmp<unknown>("/income-statement", { symbol: ticker, period: "annual", limit: "5" }),
+    fetchFmp<unknown>("/balance-sheet-statement", { symbol: ticker, period: "annual", limit: "5" }),
+    fetchFmp<unknown>("/cash-flow-statement", { symbol: ticker, period: "annual", limit: "5" }),
     fetchFmp<unknown>("/income-statement", { symbol: ticker, period: "quarter", limit: "4" }),
     fetchFmp<unknown>("/balance-sheet-statement", { symbol: ticker, period: "quarter", limit: "4" }),
     fetchFmp<unknown>("/cash-flow-statement", { symbol: ticker, period: "quarter", limit: "4" }),

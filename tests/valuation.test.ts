@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { loadFmpFundamentals } from "../lib/data/fmp-fundamentals";
 import { buildUnleveredFreeCashFlow } from "../lib/model/valuation";
 
 const APPLE_2025_10K = "https://www.sec.gov/Archives/edgar/data/320193/000032019325000079/aapl-20250927.htm";
@@ -46,4 +47,42 @@ test("stock compensation remains an economic cost unless explicitly added back",
   const defaultTreatment = buildUnleveredFreeCashFlow(base);
   const addBackTreatment = buildUnleveredFreeCashFlow({ ...base, addBackStockCompensation: true });
   assert.equal(addBackTreatment.unleveredFreeCashFlow - defaultTreatment.unleveredFreeCashFlow, 12_863);
+});
+
+test("FMP fallback stays within the five-period statement entitlement", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.FMP_API_KEY;
+  const requestedUrls: URL[] = [];
+  process.env.FMP_API_KEY = "test-only-key";
+  globalThis.fetch = (async (input) => {
+    const url = new URL(String(input));
+    requestedUrls.push(url);
+    const annual = url.searchParams.get("period") === "annual";
+    let payload: unknown[] = [];
+    if (url.pathname.endsWith("/profile")) {
+      payload = [{ companyName: "Test Company", sector: "Technology", industry: "Software" }];
+    } else if (annual && url.pathname.endsWith("/income-statement")) {
+      payload = [{ date: "2025-06-30", fiscalYear: 2025, period: "FY", revenue: 100_000_000, operatingIncome: 20_000_000 }];
+    } else if (annual && url.pathname.endsWith("/balance-sheet-statement")) {
+      payload = [{ date: "2025-06-30", cashAndCashEquivalents: 10_000_000, totalStockholdersEquity: 50_000_000 }];
+    } else if (annual && url.pathname.endsWith("/cash-flow-statement")) {
+      payload = [{ date: "2025-06-30", depreciationAndAmortization: 5_000_000, capitalExpenditure: -4_000_000 }];
+    }
+    return new Response(JSON.stringify(payload), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  try {
+    await loadFmpFundamentals("TEST");
+    const annualStatementRequests = requestedUrls.filter((url) =>
+      url.searchParams.get("period") === "annual");
+    assert.equal(annualStatementRequests.length, 3);
+    assert.equal(annualStatementRequests.every((url) => url.searchParams.get("limit") === "5"), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.FMP_API_KEY;
+    else process.env.FMP_API_KEY = originalKey;
+  }
 });

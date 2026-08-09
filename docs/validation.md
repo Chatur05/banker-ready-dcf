@@ -6,7 +6,9 @@ Validation date: 2026-08-09
 
 The calculation engine, production build, invalid-input refusal, and an Apple filing-based hand check are automated. Document-level source mapping was reconciled against Apple FY2025 and Microsoft FY2025 filings.
 
-An end-to-end live extraction run is **not yet verified in this execution environment**. Direct requests from the app process to the SEC data host return HTTP 403, and `FMP_API_KEY` is not configured. The application therefore refuses to produce a valuation here. This is the intended failure mode; no market input or filing value was fabricated to make the test pass.
+Live extraction was verified for AAPL and MSFT on 2026-08-09. Direct requests from the app process to the SEC data host still return HTTP 403, so the run used the disclosed FMP filing fallback. Each ticker returned five annual periods, a latest interim period, current price, 10-year Treasury rate, U.S. equity risk premium, bottom-up relevered beta, and peer-derived target debt/equity weights. The configured FMP plan permits at most five statement periods; the fallback adapter and regression suite enforce that limit.
+
+The live payload still reports blocking gaps rather than producing a false-precision valuation. For both validation tickers, the unresolved fields were terminal growth, exit multiple, operating lease liabilities, usable NOL value, options, option strike price, and RSUs. Those inputs must be sourced or explicitly entered and labeled before a per-share output is allowed.
 
 ## Apple FY2025 filing reconciliation
 
@@ -81,7 +83,7 @@ The engine result ties to the independently written arithmetic within less than 
 
 ## Items not yet verified
 
-- Five-year context selection and latest-quarter normalization through the live SEC adapter in the deployed runtime.
-- Live FMP quote, Treasury, ERP, peer history, bottom-up beta, peer capital structure, and exit-multiple responses for the configured plan.
-- A full Apple and Microsoft valuation output, because doing so without those live market inputs would violate the no-fabrication rule.
+- Five-year context selection and latest-quarter normalization through the primary SEC adapter in the deployed runtime; the SEC host currently returns HTTP 403 there.
+- A sourced terminal-growth benchmark and peer exit multiple from the configured FMP plan; the live endpoints returned no usable values.
+- A full Apple and Microsoft valuation output, because the remaining terminal and equity-bridge gaps must be sourced or explicitly entered before valuation.
 - Spreadsheet recalculation in desktop Excel; the export formulas are structurally tested and still require a final open/recalculate check on a complete, sourced model.
