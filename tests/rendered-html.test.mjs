@@ -20,9 +20,9 @@ test("server-renders the valuation workbench", async () => {
 
   const html = await response.text();
   assert.match(html, /<title>Banker Ready DCF<\/title>/i);
-  assert.match(html, /Every number has[\s\S]*somewhere to go back to/i);
+  assert.match(html, /A complete first view[\s\S]*Every assumption visible/i);
   assert.match(html, /Build valuation/i);
-  assert.match(html, /Missing facts stop the model by design/i);
+  assert.match(html, /Review defaults are disclosed and editable/i);
   assert.doesNotMatch(html, /Your site is taking shape|Building your site/i);
 });
 

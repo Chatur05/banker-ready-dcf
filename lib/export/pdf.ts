@@ -7,6 +7,11 @@ const percent = (value: number | null) => value === null ? "Unavailable" : `${(v
 const escapePdf = (value: string) => value.replaceAll("\\", "\\\\").replaceAll("(", "\\(").replaceAll(")", "\\)");
 
 export function buildPdf(payload: ModelPayload, assumptions: ProjectionAssumptions, result: DcfResult): Uint8Array {
+  const reviewCount = payload.gaps.filter((gap) => gap.severity === "review").length;
+  const warningCount = payload.gaps.filter((gap) => gap.severity === "warning").length;
+  const exitMultiple = assumptions.exitMultiple.value === null
+    ? "Unavailable"
+    : `${assumptions.exitMultiple.value.toFixed(1)}x`;
   const lines = [
     { text: "BANKER READY DCF", size: 18, y: 748 },
     { text: `${payload.identity.ticker} | ${payload.identity.name}`, size: 12, y: 724 },
@@ -17,16 +22,16 @@ export function buildPdf(payload: ModelPayload, assumptions: ProjectionAssumptio
     { text: `Enterprise value: ${money(result.enterpriseValueGordon)}mm`, size: 10, y: 620 },
     { text: `Common equity value: ${money(result.commonEquityValueGordon)}mm`, size: 10, y: 603 },
     { text: "Core assumptions", size: 12, y: 570 },
-    { text: `WACC ${percent(result.wacc)} | Terminal growth ${percent(assumptions.terminalGrowth.value)} | Exit multiple ${assumptions.exitMultiple.value?.toFixed(1) ?? "Unavailable"}x`, size: 10, y: 550 },
+    { text: `WACC ${percent(result.wacc)} | Terminal growth ${percent(assumptions.terminalGrowth.value)} | Exit multiple ${exitMultiple}`, size: 10, y: 550 },
     { text: `Terminal ROIC ${percent(assumptions.terminalRoic.value)} | TV / EV ${percent(result.terminalValuePctEnterpriseValue)}`, size: 10, y: 533 },
     { text: `Cost of equity ${percent(result.costOfEquity)} | After-tax cost of debt ${percent(result.afterTaxCostOfDebt)}`, size: 10, y: 516 },
     { text: "Enterprise-to-equity bridge", size: 12, y: 483 },
     { text: `Net bridge adjustments: ${money(result.bridgeAdjustments)}mm | Fully diluted shares: ${result.fullyDilutedShares?.toFixed(1) ?? "Unavailable"}mm`, size: 10, y: 463 },
     { text: "Risk and audit", size: 12, y: 430 },
-    { text: result.ready ? "Model status: valuation complete" : `Model status: blocked by ${result.errors.length} required input(s)`, size: 10, y: 410 },
+    { text: result.ready ? `Model status: preliminary valuation ready | ${reviewCount} review item(s) | ${warningCount} source warning(s)` : `Model status: blocked by ${result.errors.length} critical check(s)`, size: 10, y: 410 },
     { text: result.warnings[0] ?? "No terminal-value warning triggered.", size: 9, y: 393 },
     { text: "Fundamentals: SEC EDGAR Company Facts and filings. Market inputs: FMP Stable API when configured.", size: 8, y: 345 },
-    { text: "Every workbook input is labeled sourced, derived, assumed, or missing. No missing value is silently estimated.", size: 8, y: 332 },
+    { text: "Every input is labeled sourced, derived, review, or missing. Review defaults are editable and never presented as sourced facts.", size: 8, y: 332 },
   ];
   const stream = ["BT", "/F1 10 Tf"];
   for (const line of lines) {

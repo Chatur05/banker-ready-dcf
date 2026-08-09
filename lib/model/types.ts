@@ -20,7 +20,7 @@ export type TaggedValue = {
 export type DataGap = {
   field: string;
   reason: string;
-  severity: "blocking" | "warning";
+  severity: "blocking" | "review" | "warning";
   affectedOutputs: string[];
 };
 
@@ -94,8 +94,17 @@ export type PeerBeta = {
   sourceUrl: string;
 };
 
+export type AnalystEstimate = {
+  fiscalDate: string;
+  revenue: number;
+  ebit: number | null;
+  revenueAnalystCount: number | null;
+  sourceUrl: string;
+};
+
 export type MarketInputs = {
   currentPrice: TaggedValue;
+  currentShares: TaggedValue;
   fiftyTwoWeekLow: TaggedValue;
   fiftyTwoWeekHigh: TaggedValue;
   riskFreeRate: TaggedValue;
@@ -107,6 +116,7 @@ export type MarketInputs = {
   targetDebtWeight: TaggedValue;
   targetEquityWeight: TaggedValue;
   peerBetas: PeerBeta[];
+  analystEstimates: AnalystEstimate[];
 };
 
 export type ProjectionAssumptions = {

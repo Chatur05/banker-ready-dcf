@@ -6,9 +6,11 @@ Validation date: 2026-08-09
 
 The calculation engine, production build, invalid-input refusal, and an Apple filing-based hand check are automated. Document-level source mapping was reconciled against Apple FY2025 and Microsoft FY2025 filings.
 
-Live extraction was verified for AAPL and MSFT on 2026-08-09. Direct requests from the app process to the SEC data host still return HTTP 403, so the run used the disclosed FMP filing fallback. Each ticker returned five annual periods, a latest interim period, current price, 10-year Treasury rate, U.S. equity risk premium, bottom-up relevered beta, and peer-derived target debt/equity weights. The configured FMP plan permits at most five statement periods; the fallback adapter and regression suite enforce that limit.
+Live extraction was verified for AAPL and MSFT on 2026-08-09. Direct requests from the app process to the SEC data host still return HTTP 403, so the run used the disclosed FMP filing fallback. The configured FMP statement entitlement permits at most five annual periods; the fallback adapter and regression suite enforce that limit.
 
-The live payload still reports blocking gaps rather than producing a false-precision valuation. For both validation tickers, the unresolved fields were terminal growth, exit multiple, operating lease liabilities, usable NOL value, options, option strike price, and RSUs. Those inputs must be sourced or explicitly entered and labeled before a per-share output is allowed.
+The automatic case now calculates a preliminary Gordon-growth per-share value without manual data entry. Available analyst consensus drives the first three forecast years and then fades toward mature-state growth and margins. Terminal growth, terminal ROIC, lease treatment, NOL value, and dilution fallbacks remain visible review items. The exit-multiple method is an independent cross-check and can be absent without suppressing the primary intrinsic value.
+
+The regression suite verifies that Gordon growth completes without an exit multiple or current market price, that missing price data uses conservative option dilution without blocking intrinsic value, that stock compensation treatment remains explicit, and that the Apple operating build still ties to sourced filing arithmetic. A live AAPL automatic case completed with five annual periods, three consensus forecast years, no critical model errors, and a formula-derived per-share value before the configured FMP key reached its plan limit during repeated validation calls.
 
 ## Apple FY2025 filing reconciliation
 
@@ -40,7 +42,7 @@ Primary source: [Apple FY2025 Form 10-K](https://www.sec.gov/Archives/edgar/data
 | Weighted-average basic / diluted shares | 14,948.500 / 15,004.697 | Statement of operations | Tied |
 | Outstanding RSUs | 151.574 | Note 11 ending balance | Tied |
 
-Apple does not present an outstanding option schedule in the cited note. The engine must therefore request a reviewed zero or another sourced input; it does not infer zero. NCI, preferred stock, equity-method investments, and the present value of usable NOLs follow the same blocking policy when a standardized fact is absent.
+Apple does not present an outstanding option schedule in the cited note. When award-level options and RSUs are incomplete, the engine uses current shares multiplied by the latest diluted/basic weighted-average share ratio as one combined, labeled dilution proxy. NCI, preferred stock, non-operating investments, and usable NOL value receive conservative review defaults when standardized detail is absent.
 
 ## Microsoft FY2025 filing reconciliation
 
@@ -84,6 +86,6 @@ The engine result ties to the independently written arithmetic within less than 
 ## Items not yet verified
 
 - Five-year context selection and latest-quarter normalization through the primary SEC adapter in the deployed runtime; the SEC host currently returns HTTP 403 there.
-- A sourced terminal-growth benchmark and peer exit multiple from the configured FMP plan; the live endpoints returned no usable values.
-- A full Apple and Microsoft valuation output, because the remaining terminal and equity-bridge gaps must be sourced or explicitly entered before valuation.
+- A repeat live Microsoft automatic-case smoke test after the latest low-call market-input optimization; the configured FMP key reached its plan limit during repeated validation requests.
+- Company-specific award-level dilution and lease-note parsing through the primary SEC adapter in the deployed runtime.
 - Spreadsheet recalculation in desktop Excel; the export formulas are structurally tested and still require a final open/recalculate check on a complete, sourced model.

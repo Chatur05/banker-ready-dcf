@@ -1,5 +1,5 @@
-import { covarianceBeta, median } from "../model/math";
-import type { MarketInputs, PeerBeta, TaggedValue } from "../model/types";
+import { median } from "../model/math";
+import type { AnalystEstimate, MarketInputs, TaggedValue } from "../model/types";
 
 const FMP_BASE = "https://financialmodelingprep.com/stable";
 const CACHE_TTL = 30 * 60 * 1000;
@@ -41,30 +41,50 @@ export async function fetchFmp<T>(path: string, params: Record<string, string> =
   const cached = memoryCache.get(cacheKey);
   if (cached && cached.expires > Date.now()) return cached.value as T;
   query.set("apikey", apiKey);
-  const response = await fetch(`${FMP_BASE}${path}?${query.toString()}`, {
-    headers: { Accept: "application/json" },
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!response.ok) throw new Error(`FMP request failed (${response.status}) for ${path}`);
-  const value = await response.json() as T;
-  memoryCache.set(cacheKey, { expires: Date.now() + CACHE_TTL, value });
-  return value;
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const response = await fetch(`${FMP_BASE}${path}?${query.toString()}`, {
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (response.ok) {
+        const value = await response.json() as T;
+        memoryCache.set(cacheKey, { expires: Date.now() + CACHE_TTL, value });
+        return value;
+      }
+      lastError = new Error(`FMP request failed (${response.status}) for ${path}`);
+      if (response.status !== 429 && response.status < 500) break;
+      if (attempt === 2) break;
+      const retryAfter = Number(response.headers.get("Retry-After"));
+      const delayMs = Number.isFinite(retryAfter) && retryAfter > 0
+        ? Math.min(5_000, retryAfter * 1_000)
+        : 750 * (attempt + 1);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error("FMP request failed.");
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+    }
+  }
+  throw lastError ?? new Error(`FMP request failed for ${path}`);
 }
 
 export function marketInputsUnavailable(reason: string): MarketInputs {
   return {
     currentPrice: missing("Current market price", "$ / share", reason),
+    currentShares: missing("Current shares outstanding", "mm shares", reason),
     fiftyTwoWeekLow: missing("52-week low", "$ / share", reason),
     fiftyTwoWeekHigh: missing("52-week high", "$ / share", reason),
     riskFreeRate: missing("10-year U.S. Treasury rate", "%", reason),
     equityRiskPremium: missing("U.S. equity risk premium", "%", reason),
     terminalGdpGrowth: missing("Long-run nominal GDP growth", "%", reason),
     peerExitMultiple: missing("Peer median EV/EBITDA", "x", reason),
-    releveredBeta: missing("Relevered peer beta", "x", reason),
+    releveredBeta: missing("Levered beta", "x", reason),
     preTaxCostOfDebt: missing("Pre-tax cost of debt", "%", "Derived from historical interest expense when available."),
     targetDebtWeight: missing("Target debt weight", "%", reason),
     targetEquityWeight: missing("Target equity weight", "%", reason),
     peerBetas: [],
+    analystEstimates: [],
   };
 }
 
@@ -88,72 +108,10 @@ function numeric(record: Record<string, unknown> | undefined, keys: string[]): n
   return null;
 }
 
-type PricePoint = { date: string; close: number };
-
-function weeklyReturns(points: PricePoint[]): Map<string, number> {
-  const sorted = [...points].sort((a, b) => a.date.localeCompare(b.date));
-  const weekly = new Map<string, PricePoint>();
-  for (const point of sorted) {
-    const date = new Date(`${point.date}T00:00:00Z`);
-    const firstThursday = new Date(Date.UTC(date.getUTCFullYear(), 0, 4));
-    const dayOfYear = Math.floor((date.getTime() - Date.UTC(date.getUTCFullYear(), 0, 1)) / 86_400_000) + 1;
-    const week = Math.ceil((dayOfYear + ((firstThursday.getUTCDay() + 6) % 7)) / 7);
-    weekly.set(`${date.getUTCFullYear()}-${String(week).padStart(2, "0")}`, point);
-  }
-  const entries = [...weekly.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-  const returns = new Map<string, number>();
-  for (let index = 1; index < entries.length; index += 1) {
-    const prior = entries[index - 1][1].close;
-    const current = entries[index][1].close;
-    if (prior > 0 && current > 0) returns.set(entries[index][0], current / prior - 1);
-  }
-  return returns;
-}
-
-async function priceHistory(symbol: string, from: string, to: string): Promise<PricePoint[]> {
-  const payload = await fetchFmp<unknown>("/historical-price-eod/dividend-adjusted", { symbol, from, to });
-  return arrayPayload<Record<string, unknown>>(payload)
-    .map((record) => ({
-      date: String(record.date ?? ""),
-      close: numeric(record, ["adjClose", "adjustedClose", "close"]) ?? Number.NaN,
-    }))
-    .filter((point) => point.date && Number.isFinite(point.close));
-}
-
-function alignedBeta(asset: Map<string, number>, market: Map<string, number>): number | null {
-  const dates = [...asset.keys()].filter((date) => market.has(date)).sort();
-  return covarianceBeta(
-    dates.map((date) => asset.get(date)!),
-    dates.map((date) => market.get(date)!),
-  );
-}
-
-async function peerFundamentals(symbol: string): Promise<{
-  name: string;
-  debtToEquity: number | null;
-  taxRate: number | null;
-  exitMultiple: number | null;
-}> {
-  const [quotePayload, balancePayload, incomePayload, metricsPayload] = await Promise.all([
-    fetchFmp<unknown>("/quote", { symbol }),
-    fetchFmp<unknown>("/balance-sheet-statement", { symbol, limit: "1", period: "annual" }),
-    fetchFmp<unknown>("/income-statement", { symbol, limit: "1", period: "annual" }),
-    fetchFmp<unknown>("/key-metrics-ttm", { symbol }),
-  ]);
-  const quote = arrayPayload<Record<string, unknown>>(quotePayload)[0];
-  const balance = arrayPayload<Record<string, unknown>>(balancePayload)[0];
-  const income = arrayPayload<Record<string, unknown>>(incomePayload)[0];
-  const metrics = arrayPayload<Record<string, unknown>>(metricsPayload)[0];
-  const marketCap = numeric(quote, ["marketCap"]);
-  const debt = numeric(balance, ["totalDebt", "shortTermDebt", "longTermDebt"]);
-  const taxExpense = numeric(income, ["incomeTaxExpense"]);
-  const pretaxIncome = numeric(income, ["incomeBeforeTax", "incomeBeforeTaxAndMinorityInterest"]);
-  return {
-    name: String(quote?.name ?? symbol),
-    debtToEquity: marketCap && marketCap > 0 && debt !== null ? debt / marketCap : null,
-    taxRate: pretaxIncome && pretaxIncome > 0 && taxExpense !== null ? taxExpense / pretaxIncome : null,
-    exitMultiple: numeric(metrics, ["enterpriseValueOverEBITDA", "evToEBITDA"]),
-  };
+async function peerExitMultiple(symbol: string): Promise<number | null> {
+  const payload = await fetchFmp<unknown>("/key-metrics-ttm", { symbol });
+  const metrics = arrayPayload<Record<string, unknown>>(payload)[0];
+  return numeric(metrics, ["enterpriseValueOverEBITDA", "evToEBITDA"]);
 }
 
 function peerSymbols(payload: unknown, subject: string): string[] {
@@ -170,7 +128,7 @@ function peerSymbols(payload: unknown, subject: string): string[] {
   }
   return [...new Set(values.map((value) => value.toUpperCase()))]
     .filter((value) => value !== subject && /^[A-Z][A-Z0-9.-]{0,9}$/.test(value))
-    .slice(0, 5);
+    .slice(0, 4);
 }
 
 function gdpCagr(payload: unknown): { value: number | null; asOf: string } {
@@ -188,10 +146,7 @@ function gdpCagr(payload: unknown): { value: number | null; asOf: string } {
   return { value: (latest.value / prior.value) ** (1 / years) - 1, asOf: latest.date };
 }
 
-export async function loadFmpMarketInputs(
-  ticker: string,
-  subjectTaxRate: number | null,
-): Promise<MarketInputs> {
+export async function loadFmpMarketInputs(ticker: string): Promise<MarketInputs> {
   const missingReason = "Configure the server-side FMP_API_KEY or enter and label the input manually.";
   if (!process.env.FMP_API_KEY) return marketInputsUnavailable(missingReason);
 
@@ -199,15 +154,18 @@ export async function loadFmpMarketInputs(
   const fromDate = new Date();
   fromDate.setUTCFullYear(fromDate.getUTCFullYear() - 2);
   const from = fromDate.toISOString().slice(0, 10);
-  const [quotePayload, treasuryPayload, premiumPayload, gdpPayload, peersPayload, marketHistory] = await Promise.all([
-    fetchFmp<unknown>("/quote", { symbol: ticker }),
-    fetchFmp<unknown>("/treasury-rates", { from, to: today }),
-    fetchFmp<unknown>("/market-risk-premium", {}),
-    fetchFmp<unknown>("/economic-indicators", { name: "GDP", from: "2000-01-01", to: today }),
-    fetchFmp<unknown>("/stock-peers", { symbol: ticker }),
-    priceHistory("SPY", from, today),
+  const optional = <T>(request: Promise<T>, fallback: T) => request.catch(() => fallback);
+  const [quotePayload, profilePayload, treasuryPayload, premiumPayload, gdpPayload, peersPayload, estimatesPayload] = await Promise.all([
+    optional(fetchFmp<unknown>("/quote", { symbol: ticker }), []),
+    optional(fetchFmp<unknown>("/profile", { symbol: ticker }), []),
+    optional(fetchFmp<unknown>("/treasury-rates", { from, to: today }), []),
+    optional(fetchFmp<unknown>("/market-risk-premium", {}), []),
+    optional(fetchFmp<unknown>("/economic-indicators", { name: "GDP", from: "2000-01-01", to: today }), []),
+    optional(fetchFmp<unknown>("/stock-peers", { symbol: ticker }), []),
+    optional(fetchFmp<unknown>("/analyst-estimates", { symbol: ticker, period: "annual", page: "0", limit: "10" }), []),
   ]);
   const quote = arrayPayload<Record<string, unknown>>(quotePayload)[0];
+  const profile = arrayPayload<Record<string, unknown>>(profilePayload)[0];
   const quoteDate = String(quote?.timestamp ? new Date(Number(quote.timestamp) * 1000).toISOString().slice(0, 10) : today);
   const treasuries = arrayPayload<Record<string, unknown>>(treasuryPayload)
     .sort((a, b) => String(b.date ?? "").localeCompare(String(a.date ?? "")));
@@ -216,47 +174,45 @@ export async function loadFmpMarketInputs(
     .find((record) => String(record.country ?? "").toLowerCase().includes("united states"));
   const gdp = gdpCagr(gdpPayload);
   const symbols = peerSymbols(peersPayload, ticker);
-  const marketReturns = weeklyReturns(marketHistory);
-
-  const peerBetas: PeerBeta[] = [];
   const exitMultiples: number[] = [];
-  const debtToEquityValues: number[] = [];
   for (const symbol of symbols) {
     try {
-      const [history, fundamentals] = await Promise.all([
-        priceHistory(symbol, from, today),
-        peerFundamentals(symbol),
-      ]);
-      const rawBeta = alignedBeta(weeklyReturns(history), marketReturns);
-      if (rawBeta === null || fundamentals.debtToEquity === null || fundamentals.taxRate === null) continue;
-      const unleveredBeta = rawBeta / (1 + (1 - fundamentals.taxRate) * fundamentals.debtToEquity);
-      peerBetas.push({
-        ticker: symbol,
-        name: fundamentals.name,
-        rawBeta,
-        debtToEquity: fundamentals.debtToEquity,
-        taxRate: fundamentals.taxRate,
-        unleveredBeta,
-        sourceUrl: `${FMP_BASE}/historical-price-eod/dividend-adjusted?symbol=${symbol}`,
-      });
-      debtToEquityValues.push(fundamentals.debtToEquity);
-      if (fundamentals.exitMultiple !== null && fundamentals.exitMultiple > 0) {
-        exitMultiples.push(fundamentals.exitMultiple);
-      }
+      const peerMultiple = await peerExitMultiple(symbol);
+      if (peerMultiple !== null && peerMultiple > 0 && peerMultiple <= 50) exitMultiples.push(peerMultiple);
     } catch {
-      // A failed peer is excluded; the resulting coverage gap is visible in peerBetas.
+      // A failed peer is excluded; the model can fall back to subject-company EV/EBITDA.
     }
   }
-  const medianUnlevered = median(peerBetas.map((peer) => peer.unleveredBeta));
-  const targetDebtToEquity = median(debtToEquityValues);
-  const releveredBeta = medianUnlevered !== null && targetDebtToEquity !== null && subjectTaxRate !== null
-    ? medianUnlevered * (1 + (1 - subjectTaxRate) * targetDebtToEquity)
-    : null;
-  const targetDebtWeight = targetDebtToEquity !== null ? targetDebtToEquity / (1 + targetDebtToEquity) : null;
-  const targetEquityWeight = targetDebtWeight !== null ? 1 - targetDebtWeight : null;
+  const quotePrice = numeric(quote, ["price"]);
+  const quoteMarketCap = numeric(quote, ["marketCap"]);
+  const quoteShares = numeric(quote, ["sharesOutstanding"])
+    ?? (quotePrice !== null && quotePrice > 0 && quoteMarketCap !== null ? quoteMarketCap / quotePrice : null);
+  const analystEstimates: AnalystEstimate[] = arrayPayload<Record<string, unknown>>(estimatesPayload)
+    .map((record) => {
+      const revenue = numeric(record, ["revenueAvg"]);
+      const ebit = numeric(record, ["ebitAvg"]);
+      const analystCount = numeric(record, ["numAnalystsRevenue"]);
+      return {
+        fiscalDate: String(record.date ?? ""),
+        revenue: revenue === null ? Number.NaN : revenue / 1_000_000,
+        ebit: ebit === null ? null : ebit / 1_000_000,
+        revenueAnalystCount: analystCount,
+        sourceUrl: `${FMP_BASE}/analyst-estimates?symbol=${ticker}&period=annual`,
+      };
+    })
+    .filter((estimate) => estimate.fiscalDate && Number.isFinite(estimate.revenue) && estimate.revenue > 0)
+    .sort((a, b) => a.fiscalDate.localeCompare(b.fiscalDate));
 
   return {
-    currentPrice: sourced(numeric(quote, ["price"]), "Current market price", "$ / share", `/quote?symbol=${ticker}`, quoteDate),
+    currentPrice: sourced(quotePrice, "Current market price", "$ / share", `/quote?symbol=${ticker}`, quoteDate),
+    currentShares: sourced(
+      (quoteShares ?? Number.NaN) / 1_000_000,
+      "Current shares outstanding",
+      "mm shares",
+      `/quote?symbol=${ticker}`,
+      quoteDate,
+      "Latest quote shares outstanding, or market capitalization divided by price when the direct field is unavailable.",
+    ),
     fiftyTwoWeekLow: sourced(numeric(quote, ["yearLow", "yearLow52"]), "52-week low", "$ / share", `/quote?symbol=${ticker}`, quoteDate),
     fiftyTwoWeekHigh: sourced(numeric(quote, ["yearHigh", "yearHigh52"]), "52-week high", "$ / share", `/quote?symbol=${ticker}`, quoteDate),
     riskFreeRate: sourced(
@@ -275,10 +231,11 @@ export async function loadFmpMarketInputs(
     ),
     terminalGdpGrowth: sourced(gdp.value, "10-year nominal GDP CAGR", "%", "/economic-indicators?name=GDP", gdp.asOf, "Used as the terminal-growth warning benchmark, not as a hidden valuation input."),
     peerExitMultiple: sourced(median(exitMultiples), "Peer median EV/EBITDA", "x", "/key-metrics-ttm", today),
-    releveredBeta: sourced(releveredBeta, "Bottom-up peer beta, relevered", "x", "/stock-peers", today, "Two-year weekly betas versus SPY; median asset beta relevered at peer-median market D/E."),
+    releveredBeta: sourced(numeric(profile, ["beta"]), "Reported levered beta", "x", `/profile?symbol=${ticker}`, today, "FMP subject-company beta; editable and surfaced for review rather than reconstructed through high-volume peer price requests."),
     preTaxCostOfDebt: missing("Pre-tax cost of debt", "%", "Derived from SEC historical interest expense in the model payload."),
-    targetDebtWeight: sourced(targetDebtWeight, "Peer-median target debt weight", "%", "/stock-peers", today),
-    targetEquityWeight: sourced(targetEquityWeight, "Peer-median target equity weight", "%", "/stock-peers", today),
-    peerBetas,
+    targetDebtWeight: missing("Target debt weight", "%", "Derived from current debt and equity market value when a peer-capitalization set is unavailable."),
+    targetEquityWeight: missing("Target equity weight", "%", "Derived as the residual capital weight after debt and preferred equity."),
+    peerBetas: [],
+    analystEstimates,
   };
 }

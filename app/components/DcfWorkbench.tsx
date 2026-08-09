@@ -36,7 +36,8 @@ function assumedValue(current: TaggedValue, value: number | null): TaggedValue {
 }
 
 function OriginBadge({ value }: { value: TaggedValue }) {
-  return <span className={`origin origin-${value.provenance.origin}`}>{value.provenance.origin}</span>;
+  const label = value.provenance.origin === "assumed" ? "review" : value.provenance.origin;
+  return <span className={`origin origin-${value.provenance.origin}`} title={value.provenance.notes}>{label}</span>;
 }
 
 function EditableField({
@@ -65,7 +66,7 @@ function EditableField({
           type="number"
           step="any"
           value={tagged.value === null ? "" : tagged.value * scale}
-          placeholder="Required"
+          placeholder="Enter value"
           onChange={(event) => onChange(event.target.value === "" ? null : Number(event.target.value) / scale)}
         />
         {suffix ? <span>{suffix}</span> : null}
@@ -73,16 +74,18 @@ function EditableField({
       <span className="field-note">
         {tagged.provenance.sourceUrl
           ? <a href={tagged.provenance.sourceUrl} target="_blank" rel="noreferrer">Source · {tagged.provenance.asOf ?? tagged.provenance.filingDate}</a>
-          : tagged.provenance.notes}
+          : null}
+        {tagged.provenance.notes ? <span>{tagged.provenance.sourceUrl ? " · " : ""}{tagged.provenance.notes}</span> : null}
       </span>
     </label>
   );
 }
 
-function StatusPill({ result }: { result: DcfResult | null }) {
+function StatusPill({ result, reviewCount }: { result: DcfResult | null; reviewCount: number }) {
   if (!result) return <span className="status-pill neutral"><span />Awaiting ticker</span>;
+  if (result.ready && reviewCount > 0) return <span className="status-pill review"><span />Review ready · {reviewCount} items</span>;
   if (result.ready) return <span className="status-pill pass"><span />Valuation complete</span>;
-  return <span className="status-pill fail"><span />Blocked · {result.errors.length} required inputs</span>;
+  return <span className="status-pill fail"><span />Blocked · {result.errors.length} critical checks</span>;
 }
 
 function valueAt(
@@ -116,7 +119,8 @@ function SensitivityTable({
   currentPrice: number | null;
   kind: "growth" | "multiple";
 }) {
-  if (result.wacc === null || assumptions.terminalGrowth.value === null || assumptions.exitMultiple.value === null) {
+  if (result.wacc === null || assumptions.terminalGrowth.value === null
+    || (kind === "multiple" && assumptions.exitMultiple.value === null)) {
     return <div className="empty-panel">Complete WACC and terminal inputs to render this table.</div>;
   }
   const waccs = [-0.01, -0.005, 0, 0.005, 0.01].map((delta) => result.wacc! + delta);
@@ -248,25 +252,57 @@ export function DcfWorkbench() {
   const heroPrice = result?.impliedSharePriceGordon ?? null;
   const currentMarketPrice = currentPrice?.value ?? null;
   const annual = payload?.historicals.annual ?? [];
+  const reviewItems = payload?.gaps.filter((gap) => gap.severity === "review") ?? [];
+  const warningItems = payload?.gaps.filter((gap) => gap.severity === "warning") ?? [];
+  const criticalItems = payload?.gaps.filter((gap) => gap.severity === "blocking") ?? [];
+  const coverageValues: TaggedValue[] = assumptions && bridge && currentPrice ? [
+    ...assumptions.revenueGrowth,
+    ...assumptions.ebitMargin,
+    ...assumptions.depreciationAmortizationPctRevenue,
+    ...assumptions.stockBasedCompensationPctRevenue,
+    ...assumptions.capitalExpendituresPctRevenue,
+    ...assumptions.netWorkingCapitalPctRevenue,
+    ...assumptions.operatingTaxRate,
+    assumptions.terminalGrowth,
+    assumptions.terminalRoic,
+    assumptions.exitMultiple,
+    assumptions.riskFreeRate,
+    assumptions.equityRiskPremium,
+    assumptions.releveredBeta,
+    assumptions.countryRiskPremium,
+    assumptions.sizePremium,
+    assumptions.preTaxCostOfDebt,
+    assumptions.debtWeight,
+    assumptions.equityWeight,
+    assumptions.preferredWeight,
+    assumptions.preferredCost,
+    assumptions.usableInterestTaxRate,
+    ...Object.values(bridge),
+    currentPrice,
+  ] : [];
+  const coverage = coverageValues.reduce((counts, value) => {
+    counts[value.provenance.origin] += 1;
+    return counts;
+  }, { sourced: 0, derived: 0, assumed: 0, missing: 0 });
 
   return (
     <main>
       <header className="site-header">
         <a className="brand" href="#top" aria-label="Banker Ready DCF home"><span>BR</span>Banker Ready DCF</a>
-        <div className="header-meta"><StatusPill result={result} /><span>Sources checked {payload ? new Date(payload.generatedAt).toLocaleString() : "on request"}</span></div>
+        <div className="header-meta"><StatusPill result={result} reviewCount={reviewItems.length} /><span>Sources checked {payload ? new Date(payload.generatedAt).toLocaleString() : "on request"}</span></div>
       </header>
 
       <section className="hero" id="top">
         <div className="hero-copy">
           <p className="eyebrow">Public-equity valuation · source to share price</p>
-          <h1>Every number has<br />somewhere to go back to.</h1>
-          <p className="lede">A filing-led DCF that refuses to turn a missing fact into a confident answer. SEC historicals, first-principles WACC, dual terminal methods, a full equity bridge, and formulas you can audit.</p>
+          <h1>A complete first view.<br />Every assumption visible.</h1>
+          <p className="lede">Build an immediate, review-ready DCF from filing history, analyst consensus, market inputs, and conservative bridge defaults. Edit any assumption and watch the per-share value update instantly.</p>
           <form className="ticker-form" onSubmit={loadTicker}>
             <label htmlFor="ticker">Enter a U.S. ticker</label>
-            <div><input id="ticker" value={ticker} onChange={(event) => setTicker(event.target.value.toUpperCase())} placeholder="AAPL" maxLength={10} autoComplete="off" /><button disabled={loading}>{loading ? "Tracing filings…" : "Build valuation"}</button></div>
+            <div><input id="ticker" value={ticker} onChange={(event) => setTicker(event.target.value.toUpperCase())} placeholder="AAPL" maxLength={10} autoComplete="off" /><button disabled={loading}>{loading ? "Building the case…" : "Build valuation"}</button></div>
           </form>
           {requestError ? <div className="refusal"><strong>No valuation produced.</strong> {requestError}</div> : null}
-          <div className="source-strip"><span><i className="dot source" />Sourced</span><span><i className="dot derived" />Derived</span><span><i className="dot assumed" />Assumed</span><span><i className="dot missing" />Missing blocks output</span></div>
+          <div className="source-strip"><span><i className="dot source" />Sourced {payload ? coverage.sourced : ""}</span><span><i className="dot derived" />Derived {payload ? coverage.derived : ""}</span><span><i className="dot assumed" />Review {payload ? coverage.assumed : ""}</span><span><i className="dot missing" />Critical {payload ? criticalItems.length : ""}</span></div>
         </div>
         <aside className={`valuation-ticket ${result?.ready ? "ticket-ready" : ""}`}>
           <div className="ticket-kicker"><span>{payload?.identity.ticker ?? "—"}</span><span>{payload?.identity.exchange ?? "Awaiting issuer"}</span></div>
@@ -276,7 +312,11 @@ export function DcfWorkbench() {
           <div className="ticket-price">{money(heroPrice, 2)}</div>
           <div className="ticket-comparison"><span>Market {money(currentMarketPrice, 2)}</span><span className={(result?.upsideDownsideGordon ?? 0) >= 0 ? "positive" : "negative"}>{percent(result?.upsideDownsideGordon ?? null)}</span></div>
           <div className="ticket-grid"><div><span>WACC</span><strong>{percent(result?.wacc ?? null)}</strong></div><div><span>Terminal g</span><strong>{percent(assumptions?.terminalGrowth.value ?? null)}</strong></div><div><span>TV / EV</span><strong>{percent(result?.terminalValuePctEnterpriseValue ?? null)}</strong></div><div><span>Checks</span><strong>{result?.ready ? "PASS" : "OPEN"}</strong></div></div>
-          <div className="ticket-footer">{result?.ready ? "Ready for workbook export" : "Output remains disabled until every required input is resolved"}</div>
+          <div className="ticket-footer">{result?.ready
+            ? reviewItems.length
+              ? `Preliminary value complete · ${reviewItems.length} review items remain visible below`
+              : "Valuation complete and ready for export"
+            : "Only critical mathematical or eligibility checks can block the output"}</div>
         </aside>
       </section>
 
@@ -288,10 +328,27 @@ export function DcfWorkbench() {
             <div><span>Issuer</span><strong>{payload.identity.name}</strong></div><div><span>CIK</span><strong>{payload.identity.cik}</strong></div><div><span>Fiscal year end</span><strong>{payload.identity.fiscalYearEnd}</strong></div><div><span>Industry</span><strong>{payload.identity.sicDescription || payload.identity.sic}</strong></div><div><span>Latest interim</span><strong>{payload.historicals.latestInterim?.period.label ?? "Unavailable"}</strong></div>
           </section>
 
+          <section className={`review-summary ${result.ready ? "review-summary-ready" : "review-summary-blocked"}`} aria-live="polite">
+            <div>
+              <p className="eyebrow">Automatic case status</p>
+              <h2>{result.ready ? "Preliminary valuation ready" : "Critical checks need attention"}</h2>
+              <p>{result.ready
+                ? "The base case is fully calculated. Review the highlighted defaults, adjust your house view, and export when satisfied."
+                : "The model preserved the automatic case but stopped on an eligibility or mathematical check that would make the per-share output unreliable."}</p>
+            </div>
+            <div className="review-metrics">
+              <div><strong>{money(result.impliedSharePriceGordon, 2)}</strong><span>Gordon value / share</span></div>
+              <div><strong>{reviewItems.length}</strong><span>Review items</span></div>
+              <div><strong>{warningItems.length}</strong><span>Source warnings</span></div>
+              <div><strong>{result.errors.length}</strong><span>Critical checks</span></div>
+            </div>
+            <a href="#audit">Open review queue ↓</a>
+          </section>
+
           {!payload.identity.valuationMethodEligible ? <div className="method-refusal"><strong>FCFF method refused.</strong><p>{payload.identity.ineligibleReason}</p></div> : null}
 
           <section className="model-section" id="historicals">
-            <div className="section-heading"><div><p className="eyebrow">01 · Filing base</p><h2>Historicals that click back to the 10-K</h2></div><p>Five fiscal years plus the latest interim where SEC contexts resolve. Values are $mm; source links open the actual filing.</p></div>
+            <div className="section-heading"><div><p className="eyebrow">01 · Filing base</p><h2>Historicals with a visible audit trail</h2></div><p>Five fiscal years plus the latest interim where standardized contexts resolve. Values are $mm; available source links open the underlying filing.</p></div>
             <div className="table-shell">
               <table className="financial-table"><thead><tr><th>Fiscal period</th>{annual.map((period) => <th key={period.period.endDate}>{period.period.label}<small>{period.period.endDate}</small></th>)}</tr></thead><tbody>
                 {([
@@ -310,11 +367,11 @@ export function DcfWorkbench() {
           </section>
 
           <section className="model-section" id="assumptions">
-            <div className="section-heading"><div><p className="eyebrow">02 · Operating case</p><h2>Defaults seeded from history. Nothing buried.</h2></div><div className="control-pair"><label>Valuation date<input aria-label="Valuation date" type="date" value={assumptions.valuationDate} onChange={(event) => setAssumptions({ ...assumptions, valuationDate: event.target.value })} /></label><label>Forecast years<select value={assumptions.projectionYears} onChange={(event) => updateProjectionYears(Number(event.target.value))}>{[5, 6, 7, 8, 9, 10].map((year) => <option key={year}>{year}</option>)}</select></label><label>Discounting<select value={assumptions.discountingConvention} onChange={(event) => setAssumptions({ ...assumptions, discountingConvention: event.target.value as "mid-year" | "end-of-year" })}><option value="mid-year">Mid-year</option><option value="end-of-year">End-of-year</option></select></label></div></div>
+            <div className="section-heading"><div><p className="eyebrow">02 · Operating case</p><h2>Consensus first. Mature economics last.</h2></div><div className="control-pair"><label>Valuation date<input aria-label="Valuation date" type="date" value={assumptions.valuationDate} onChange={(event) => setAssumptions({ ...assumptions, valuationDate: event.target.value })} /></label><label>Forecast years<select value={assumptions.projectionYears} onChange={(event) => updateProjectionYears(Number(event.target.value))}>{[5, 6, 7, 8, 9, 10].map((year) => <option key={year}>{year}</option>)}</select></label><label>Discounting<select value={assumptions.discountingConvention} onChange={(event) => setAssumptions({ ...assumptions, discountingConvention: event.target.value as "mid-year" | "end-of-year" })}><option value="mid-year">Mid-year</option><option value="end-of-year">End-of-year</option></select></label></div></div>
             <div className="assumption-grid-table"><div className="assumption-row header-row"><span>Driver</span>{result.projections.map((year) => <span key={year.fiscalYear}>{year.fiscalYear}E</span>)}</div>
               {([
                 ["Revenue growth", "revenueGrowth"], ["EBIT margin", "ebitMargin"], ["D&A / revenue", "depreciationAmortizationPctRevenue"], ["SBC / revenue", "stockBasedCompensationPctRevenue"], ["Capex / revenue", "capitalExpendituresPctRevenue"], ["Operating NWC / revenue", "netWorkingCapitalPctRevenue"], ["Operating tax rate", "operatingTaxRate"],
-              ] as Array<[string, SeriesKey]>).map(([label, key]) => <div className="assumption-row" key={key}><span>{label}<OriginBadge value={assumptions[key][0]} /></span>{assumptions[key].map((tagged, index) => <input key={index} aria-label={`${label} year ${index + 1}`} type="number" step="0.1" value={tagged.value === null ? "" : (tagged.value * 100).toFixed(2)} placeholder="Required" onChange={(event) => updateSeries(key, index, event.target.value === "" ? null : Number(event.target.value) / 100)} />)}</div>)}
+              ] as Array<[string, SeriesKey]>).map(([label, key]) => <div className="assumption-row" key={key}><span>{label}<OriginBadge value={assumptions[key][0]} /></span>{assumptions[key].map((tagged, index) => <input key={index} aria-label={`${label} year ${index + 1}`} type="number" step="0.1" value={tagged.value === null ? "" : (tagged.value * 100).toFixed(2)} placeholder="Enter value" onChange={(event) => updateSeries(key, index, event.target.value === "" ? null : Number(event.target.value) / 100)} />)}</div>)}
             </div>
             <label htmlFor="sbc-addback" className="toggle-row"><input id="sbc-addback" aria-label="Add stock compensation back to free cash flow" type="checkbox" checked={assumptions.stockCompensationAddBack} onChange={(event) => setAssumptions({ ...assumptions, stockCompensationAddBack: event.target.checked })} /><span><strong>Add stock compensation back to FCF</strong><small>Off by default. SBC remains an economic cost; dilution is handled separately.</small></span></label>
           </section>
@@ -325,7 +382,7 @@ export function DcfWorkbench() {
               <div className="field-card">
                 <EditableField label="Risk-free rate" tagged={assumptions.riskFreeRate} scale={100} suffix="%" onChange={(value) => updateScalar("riskFreeRate", value)} />
                 <EditableField label="Equity risk premium" tagged={assumptions.equityRiskPremium} scale={100} suffix="%" onChange={(value) => updateScalar("equityRiskPremium", value)} />
-                <EditableField label="Relevered peer beta" tagged={assumptions.releveredBeta} suffix="x" onChange={(value) => updateScalar("releveredBeta", value)} />
+                <EditableField label="Levered beta" tagged={assumptions.releveredBeta} suffix="x" onChange={(value) => updateScalar("releveredBeta", value)} />
                 <EditableField label="Country risk premium" tagged={assumptions.countryRiskPremium} scale={100} suffix="%" onChange={(value) => updateScalar("countryRiskPremium", value)} />
                 <EditableField label="Size premium" tagged={assumptions.sizePremium} scale={100} suffix="%" onChange={(value) => updateScalar("sizePremium", value)} />
                 <EditableField label="Pre-tax cost of debt" tagged={assumptions.preTaxCostOfDebt} scale={100} suffix="%" onChange={(value) => updateScalar("preTaxCostOfDebt", value)} />
@@ -338,17 +395,17 @@ export function DcfWorkbench() {
             </div>
             <aside className="wacc-build">
               <p>Live WACC build</p><div><span>Cost of equity</span><strong>{percent(result.costOfEquity)}</strong></div><code>Rf + β × ERP + CRP + Size</code><div><span>After-tax cost of debt</span><strong>{percent(result.afterTaxCostOfDebt)}</strong></div><code>Kd × (1 − usable tax rate)</code><div className="wacc-total"><span>Weighted average cost of capital</span><strong>{percent(result.wacc)}</strong></div>
-              <h3>Bottom-up beta set</h3>{payload.market.peerBetas.length ? <table className="peer-table"><thead><tr><th>Peer</th><th>Raw β</th><th>D/E</th><th>Unlev. β</th></tr></thead><tbody>{payload.market.peerBetas.map((peer) => <tr key={peer.ticker}><td><a href={peer.sourceUrl} target="_blank" rel="noreferrer">{peer.ticker}</a></td><td>{peer.rawBeta.toFixed(2)}</td><td>{percent(peer.debtToEquity)}</td><td>{peer.unleveredBeta.toFixed(2)}</td></tr>)}</tbody></table> : <p className="gap-copy">Peer history unavailable. Enter a labeled beta assumption or configure the market-data key.</p>}
+              <h3>Beta source</h3>{payload.market.peerBetas.length ? <table className="peer-table"><thead><tr><th>Peer</th><th>Raw β</th><th>D/E</th><th>Unlev. β</th></tr></thead><tbody>{payload.market.peerBetas.map((peer) => <tr key={peer.ticker}><td><a href={peer.sourceUrl} target="_blank" rel="noreferrer">{peer.ticker}</a></td><td>{peer.rawBeta.toFixed(2)}</td><td>{percent(peer.debtToEquity)}</td><td>{peer.unleveredBeta.toFixed(2)}</td></tr>)}</tbody></table> : <p className="gap-copy">The automatic case uses the sourced subject-company levered beta above to avoid a high-volume market-data burst. Replace it with a reviewed bottom-up beta when your process requires one.</p>}
             </aside>
           </section>
 
           <section className="model-section" id="valuation">
-            <div className="section-heading"><div><p className="eyebrow">04 · Intrinsic value</p><h2>Two terminal methods. One explicit bridge.</h2></div><p>Gordon growth is primary; exit multiple is a market cross-check. Reciprocal outputs make inconsistency visible.</p></div>
+            <div className="section-heading"><div><p className="eyebrow">04 · Intrinsic value</p><h2>Intrinsic value first. Market cross-check second.</h2></div><p>Gordon growth calculates independently as the primary method. The exit multiple remains an editable market cross-check and never holds the intrinsic answer hostage.</p></div>
             <div className="terminal-grid"><EditableField label="Terminal growth" tagged={assumptions.terminalGrowth} scale={100} suffix="%" onChange={(value) => updateScalar("terminalGrowth", value)} /><EditableField label="Terminal ROIC" tagged={assumptions.terminalRoic} scale={100} suffix="%" onChange={(value) => updateScalar("terminalRoic", value)} /><EditableField label="Exit EV / EBITDA" tagged={assumptions.exitMultiple} suffix="x" onChange={(value) => updateScalar("exitMultiple", value)} /></div>
             {result.warnings.length ? <div className="warning-stack">{result.warnings.map((warning) => <p key={warning}>Review · {warning}</p>)}</div> : null}
             <div className="valuation-methods"><article><p>Gordon growth</p><strong>{money(result.impliedSharePriceGordon, 2)}</strong><span>EV {money(result.enterpriseValueGordon)}mm</span><span>Implied exit {multiple(result.impliedExitMultiple)}</span></article><article><p>Exit multiple</p><strong>{money(result.impliedSharePriceExit, 2)}</strong><span>EV {money(result.enterpriseValueExit)}mm</span><span>Implied growth {percent(result.impliedPerpetuityGrowth)}</span></article><article className={result.terminalValuePctEnterpriseValue !== null && result.terminalValuePctEnterpriseValue > 0.75 ? "risk-card" : ""}><p>Terminal dependence</p><strong>{percent(result.terminalValuePctEnterpriseValue)}</strong><span>Visible warning above 75%</span><span>GDP ceiling {percent(payload.market.terminalGdpGrowth.value)}</span></article></div>
             <div className="bridge-layout"><div className="field-card bridge-fields"><h3>Enterprise-to-equity bridge</h3>{([
-              ["Cash and equivalents", "cash"], ["Short-term investments", "shortTermInvestments"], ["Total debt", "debt"], ["Finance lease liabilities", "financeLeaseLiabilities"], ["Operating lease liabilities", "operatingLeaseLiabilities"], ["Minority interest", "minorityInterest"], ["Preferred stock", "preferredStock"], ["Equity-method investments", "equityMethodInvestments"], ["PV of usable NOLs", "presentValueOfNols"], ["Basic shares", "basicShares"], ["Options outstanding", "options"], ["Weighted-average strike", "optionStrikePrice"], ["RSUs", "rsus"],
+              ["Cash and equivalents", "cash"], ["Short-term investments", "shortTermInvestments"], ["Total debt", "debt"], ["Finance lease liabilities", "financeLeaseLiabilities"], ["Operating lease debt adjustment", "operatingLeaseLiabilities"], ["Minority interest", "minorityInterest"], ["Preferred stock", "preferredStock"], ["Equity-method investments", "equityMethodInvestments"], ["PV of usable NOLs", "presentValueOfNols"], ["Current shares outstanding", "basicShares"], ["Options outstanding", "options"], ["Weighted-average strike", "optionStrikePrice"], ["RSUs / dilution proxy", "rsus"],
             ] as Array<[string, BridgeKey]>).map(([label, key]) => <EditableField key={key} label={label} tagged={bridge[key]} suffix={key.includes("Shares") || key === "options" || key === "rsus" ? "mm" : key === "optionStrikePrice" ? "$" : "$mm"} onChange={(value) => updateBridge(key, value)} />)}<EditableField label="Current market price" tagged={currentPrice} suffix="$" onChange={(value) => setCurrentPrice(assumedValue(currentPrice, value))} /></div>
               <div className="waterfall"><h3>Value bridge</h3>{([
                 ["Enterprise value", result.enterpriseValueGordon], ["Cash + investments", bridge.cash.value !== null && bridge.shortTermInvestments.value !== null ? bridge.cash.value + bridge.shortTermInvestments.value : null], ["Debt + leases", bridge.debt.value !== null && bridge.financeLeaseLiabilities.value !== null && bridge.operatingLeaseLiabilities.value !== null ? -(bridge.debt.value + bridge.financeLeaseLiabilities.value + bridge.operatingLeaseLiabilities.value) : null], ["Other claims / assets", result.bridgeAdjustments !== null && bridge.cash.value !== null && bridge.shortTermInvestments.value !== null && bridge.debt.value !== null && bridge.financeLeaseLiabilities.value !== null && bridge.operatingLeaseLiabilities.value !== null ? result.bridgeAdjustments - bridge.cash.value - bridge.shortTermInvestments.value + bridge.debt.value + bridge.financeLeaseLiabilities.value + bridge.operatingLeaseLiabilities.value : null], ["Common equity value", result.commonEquityValueGordon],
@@ -367,14 +424,14 @@ export function DcfWorkbench() {
           </section>
 
           <section className="model-section audit-section" id="audit">
-            <div className="section-heading"><div><p className="eyebrow">06 · Control room</p><h2>Nothing leaves while a critical check is open.</h2></div><div className="export-actions"><button disabled={!result.ready} onClick={() => downloadExcel(effectivePayload!, assumptions, bridge, result)}>Export live-formula Excel</button><button className="secondary" disabled={!result.ready} onClick={() => downloadPdf(effectivePayload!, assumptions, result)}>Export PDF one-pager</button></div></div>
-            <div className="audit-grid"><div className="check-list"><h3>Model checks</h3>{result.errors.length ? result.errors.map((error) => <div className="check-row fail" key={error}><span>OPEN</span><p>{error}</p></div>) : <div className="check-row pass"><span>OK</span><p>All required valuation, bridge, dilution, and terminal checks pass.</p></div>}</div><div className="gap-list"><h3>Source coverage</h3>{payload.gaps.length ? payload.gaps.map((gap) => <div key={gap.field}><OriginBadge value={{ value: null, provenance: { origin: gap.severity === "blocking" ? "missing" : "derived", label: gap.field } }} /><p><strong>{gap.field}</strong>{gap.reason}</p></div>) : <p>No source gaps were reported.</p>}</div></div>
-            <div className="self-check"><strong>Self-check</strong><span>No hardcoded WACC</span><span>Debt + leases + NCI + preferred shown</span><span>Treasury-stock dilution</span><span>Dual terminal methods</span><span>Reciprocal checks</span><span>Formula export</span></div>
+            <div className="section-heading"><div><p className="eyebrow">06 · Control room</p><h2>Calculate first. Review with full context.</h2><p className="audit-intro">Exports remain formula-driven and carry the same sourced, derived, and review labels as the live model.</p></div><div className="export-actions"><button disabled={!result.ready} onClick={() => downloadExcel(effectivePayload!, assumptions, bridge, result)}>Export live-formula Excel</button><button className="secondary" disabled={!result.ready} onClick={() => downloadPdf(effectivePayload!, assumptions, result)}>Export PDF one-pager</button></div></div>
+            <div className="audit-grid"><div className="check-list"><h3>Critical model checks</h3>{result.errors.length ? result.errors.map((error) => <div className="check-row fail" key={error}><span>OPEN</span><p>{error}</p></div>) : <div className="check-row pass"><span>OK</span><p>The valuation, bridge, dilution, and stable-growth mathematics all pass.</p></div>}</div><div className="gap-list"><h3>Review queue</h3>{payload.gaps.length ? payload.gaps.map((gap) => <div className={`gap-${gap.severity}`} key={`${gap.severity}-${gap.field}`}><OriginBadge value={{ value: null, provenance: { origin: gap.severity === "blocking" ? "missing" : gap.severity === "review" ? "assumed" : "derived", label: gap.field } }} /><p><strong>{gap.field}</strong>{gap.reason}</p></div>) : <p>No review or source-coverage items were reported.</p>}</div></div>
+            <div className="self-check"><strong>Self-check</strong><span>Consensus-to-mature forecast</span><span>Independent Gordon method</span><span>Lease-consistent bridge</span><span>Diluted-share proxy fallback</span><span>Reciprocal checks</span><span>Formula export</span></div>
           </section>
         </>
-      ) : <section className="preflight"><div><span>01</span><strong>Trace SEC contexts</strong><p>Resolve five annual periods, latest interim, units, filings, and bridge facts.</p></div><div><span>02</span><strong>Derive the case</strong><p>Seed editable operating drivers from historical medians and mature-state economics.</p></div><div><span>03</span><strong>Earn the answer</strong><p>Build WACC, terminal values, dilution, sensitivities, and exports only after checks pass.</p></div></section>}
+      ) : <section className="preflight"><div><span>01</span><strong>Assemble the evidence</strong><p>Resolve filing history, latest market inputs, analyst consensus, shares, and bridge facts.</p></div><div><span>02</span><strong>Build the automatic case</strong><p>Use sourced inputs first, then transparent derived values and conservative review defaults.</p></div><div><span>03</span><strong>Show the answer</strong><p>Calculate the base per-share value immediately, with sensitivities and every review item visible.</p></div></section>}
 
-      <footer><span>Banker Ready DCF</span><p>Valuation is an analytical opinion, not investment advice. Missing facts stop the model by design.</p><a href="https://github.com/Chatur05/banker-ready-dcf" target="_blank" rel="noreferrer">GitHub ↗</a></footer>
+      <footer><span>Banker Ready DCF</span><p>Valuation is an analytical opinion, not investment advice. Review defaults are disclosed and editable; critical model errors still stop the output.</p><a href="https://github.com/Chatur05/banker-ready-dcf" target="_blank" rel="noreferrer">GitHub ↗</a></footer>
     </main>
   );
 }

@@ -7,11 +7,11 @@ Decision date: 2026-08-09
 Use a hybrid, provenance-first data architecture:
 
 - SEC EDGAR `submissions` and `companyfacts` APIs are the source of truth for historical fundamentals and filing metadata.
-- Direct filing documents remain the authoritative review source for disclosures that are not reliably standardized in Company Facts, including options, RSUs, lease details, preferred stock, NCI, and equity-method investments. Missing standardized facts block the affected output or require an explicitly labeled user input.
+- Direct filing documents remain the authoritative review source for disclosures that are not reliably standardized in Company Facts, including options, RSUs, lease details, preferred stock, NCI, and non-operating investments. Missing optional detail receives a conservative, explicitly labeled review default so the preliminary valuation can still calculate.
 - If the SEC data host is unreachable, the server may use FMP standardized filing statements as a flagged fallback. The audit trail retains the linked filing and warns the reviewer to reconcile material values before relying on the output.
-- Financial Modeling Prep (FMP) Stable API supplies market-only inputs: current and historical prices, peer suggestions, Treasury rates, and market risk premium. The key is held server-side as `FMP_API_KEY`; it is never exposed to the browser or workbook.
-- Every value is represented as sourced, derived, or assumed and carries a source URL, as-of/filing date, fiscal period, units, and confidence/gap status.
-- Missing required inputs block the affected valuation output. The app must never substitute synthetic or unlabeled data.
+- Financial Modeling Prep (FMP) Stable API supplies standardized filing fallback data, analyst estimates, current prices and shares, peer suggestions, Treasury rates, and market risk premium. The key is held server-side as `FMP_API_KEY`; it is never exposed to the browser or workbook.
+- Every value is represented as sourced, derived, review-assumed, or missing and carries a source URL, as-of/filing date, fiscal period, units, and review/gap status.
+- The automatic case follows a fixed hierarchy: user override, sourced filing/market value, derived value, then labeled house default. Only eligibility, minimum-history, share-count, and mathematical-integrity failures block the preliminary Gordon value.
 
 ## Architecture fork
 
@@ -39,17 +39,17 @@ Reviewer credentials: None.
 
 Why rejected as the sole source: SEC data does not provide live share prices, total-return histories for beta, Treasury curves, ERP, or a market peer set. It cannot independently produce a first-principles market-value WACC.
 
-### 3. Hybrid SEC fundamentals plus licensed market data — selected
+### 3. Hybrid filing fundamentals plus licensed market and consensus data — selected
 
-Coverage: SEC retains filing-grade provenance for the operating model and enterprise-to-equity bridge. FMP supplies the market-only data SEC cannot provide. Peer betas are calculated from peer price histories, then unlevered and relevered using market-value capital structures; the vendor's raw beta is never used as the final WACC input.
+Coverage: SEC retains filing-grade provenance when accessible, with FMP standardized statements as a disclosed fallback. FMP also supplies analyst consensus, the subject-company levered beta, current price and shares, macro inputs, and a bounded peer-multiple cross-check. The levered beta is editable and reviewable; a bespoke bottom-up beta can replace it without changing the model architecture.
 
 Depth and fiscal handling: SEC provides the historical depth and fiscal-period fidelity. FMP provides price history, quote, peers, Treasury, and ERP endpoints through its supported Stable API.
 
-Rate limits and cost: SEC requests are queued and cached below fair-access limits. FMP requests are cached and bounded; plan limitations surface as data gaps.
+Rate limits and cost: Requests are cached and bounded. Optional FMP endpoints degrade to review defaults independently, and transient rate-limit or server failures receive bounded retry rather than causing the entire market-input bundle to fail.
 
-Reviewer credentials: Reviewers of the deployed application need no credentials because the key remains server-side. If the deployment is not configured, the app loads filing data but blocks market-dependent valuation outputs and requests the missing inputs.
+Reviewer credentials: Reviewers of the deployed application need no credentials because the key remains server-side. If a market endpoint is unavailable, the app uses a visible house default and omits only source-dependent comparisons such as market upside/downside.
 
-Why selected: It preserves filing-level auditability while supporting a defensible market-value WACC and live valuation. It also fails safely: a missing source creates a visible gap, never a fabricated number.
+Why selected: It preserves filing-level auditability while producing a useful first-pass valuation without manual data entry. Missing information creates a visible review item; it never silently becomes a sourced fact.
 
 ## Confirmed stack
 
@@ -70,9 +70,12 @@ Why selected: It preserves filing-level auditability while supporting a defensib
 
 ## Non-negotiable failure behavior
 
-- No hardcoded WACC or terminal-value assumption.
+- No hidden WACC or terminal-value assumption; house defaults are labeled, editable, and exported to the audit trail.
 - No valuation when `WACC <= terminal growth`.
-- No valuation when material bridge items or diluted-share inputs are unresolved.
-- No silent fallback from missing sourced data to zero.
+- No valuation without at least three annual periods or a positive common-share count.
+- Gordon growth calculates independently of the exit-multiple cross-check.
+- Missing award-level dilution uses the latest reported diluted/basic share relationship; detailed awards replace the proxy when available.
+- Operating lease liabilities are not subtracted in an unadjusted-FCFF case. Lease debt is included only when the operating forecast is adjusted consistently.
+- Conservative zero defaults for optional bridge assets or claims are labeled for review and never presented as sourced.
 - Financial institutions, insurers, and REITs are refused by the FCFF engine with an explanation.
 - Source timestamps and URLs travel with every value into the UI and exports.

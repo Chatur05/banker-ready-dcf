@@ -47,7 +47,7 @@ function assumptionsSheet(assumptions: ProjectionAssumptions, payload: ModelPayl
   const years = Array.from({ length: assumptions.projectionYears }, (_, index) => `Year ${index + 1}`);
   const rows = [
     row([cell("ASSUMPTIONS", "Title"), ...years.map(() => cell("", "Title"))], 26),
-    row([cell("Blue = editable assumption | Green = sourced or derived", "Note"), ...years.map(() => cell("", "Note"))]),
+    row([cell("Blue = review default or user input | Green = sourced or derived | Review before reliance", "Note"), ...years.map(() => cell("", "Note"))]),
     row([cell("Operating assumptions", "Section"), ...years.map(() => cell("", "Section"))]),
     row([cell("Revenue growth", "Label"), ...assumptions.revenueGrowth.map((value) => cell(value.value, inputStyle(value), undefined, "Number"))]),
     row([cell("EBIT margin", "Label"), ...assumptions.ebitMargin.map((value) => cell(value.value, inputStyle(value), undefined, "Number"))]),
@@ -65,7 +65,7 @@ function assumptionsSheet(assumptions: ProjectionAssumptions, payload: ModelPayl
     row([cell("WACC assumptions", "Section"), ...years.map(() => cell("", "Section"))]),
     row([cell("Risk-free rate", "Label"), cell(assumptions.riskFreeRate.value, inputStyle(assumptions.riskFreeRate), undefined, "Number")]),
     row([cell("Equity risk premium", "Label"), cell(assumptions.equityRiskPremium.value, inputStyle(assumptions.equityRiskPremium), undefined, "Number")]),
-    row([cell("Relevered peer beta", "Label"), cell(assumptions.releveredBeta.value, inputStyle(assumptions.releveredBeta), undefined, "Number")]),
+    row([cell("Levered beta", "Label"), cell(assumptions.releveredBeta.value, inputStyle(assumptions.releveredBeta), undefined, "Number")]),
     row([cell("Country risk premium", "Label"), cell(assumptions.countryRiskPremium.value, "Input", undefined, "Number")]),
     row([cell("Size premium", "Label"), cell(assumptions.sizePremium.value, "Input", undefined, "Number")]),
     row([cell("Pre-tax cost of debt", "Label"), cell(assumptions.preTaxCostOfDebt.value, inputStyle(assumptions.preTaxCostOfDebt), undefined, "Number")]),
@@ -82,15 +82,15 @@ function assumptionsSheet(assumptions: ProjectionAssumptions, payload: ModelPayl
       ["Short-term investments", bridge.shortTermInvestments],
       ["Total debt", bridge.debt],
       ["Finance lease liabilities", bridge.financeLeaseLiabilities],
-      ["Operating lease liabilities", bridge.operatingLeaseLiabilities],
+      ["Operating lease debt adjustment", bridge.operatingLeaseLiabilities],
       ["Minority interest", bridge.minorityInterest],
       ["Preferred stock", bridge.preferredStock],
       ["Equity-method investments", bridge.equityMethodInvestments],
       ["PV of usable NOLs", bridge.presentValueOfNols],
-      ["Basic shares", bridge.basicShares],
+      ["Current shares outstanding", bridge.basicShares],
       ["Options outstanding", bridge.options],
       ["Weighted-average strike", bridge.optionStrikePrice],
-      ["RSUs", bridge.rsus],
+      ["RSUs / dilution proxy", bridge.rsus],
     ] as Array<[string, TaggedValue]>).map(([label, value]) =>
       row([cell(label, "Label"), cell(value.value, inputStyle(value), undefined, "Number")]))
   ];
@@ -163,7 +163,11 @@ function projectionSheet(payload: ModelPayload, assumptions: ProjectionAssumptio
   rows.push(projectionCells(15, (i) => projections[i].changeInNetWorkingCapital, (i) => i === 0
     ? `=R[-1]C-'Historicals'!R16C${latestHistoricalColumn}`
     : "=R[-1]C-R[-1]C[-1]"));
-  rows.push(projectionCells(16, (i) => projections[i].unleveredFreeCashFlow, () => "=R[-6]C+R[-5]C-R[-3]C-R[-1]C"));
+  rows.push(projectionCells(
+    16,
+    (i) => projections[i].unleveredFreeCashFlow,
+    () => `=R[-6]C+R[-5]C-R[-3]C-R[-1]C+IF(${assumptions.stockCompensationAddBack ? 1 : 0}=1,R[-4]C,0)`,
+  ));
   rows.push(projectionCells(17, (i) => projections[i].discountPeriod, (i) => `=${projections[i].discountPeriod}`, "Formula"));
   rows.push(projectionCells(18, (i) => projections[i].discountFactor, () => "=1/(1+'WACC'!R14C2)^R[-1]C"));
   rows.push(projectionCells(19, (i) => projections[i].presentValueOfFreeCashFlow, () => "=R[-3]C*R[-1]C", "Total"));
@@ -176,7 +180,7 @@ function waccSheet(assumptions: ProjectionAssumptions, result: DcfResult): strin
     row([cell("Every component links to an editable assumption", "Note")]),
     row([cell("Cost of equity", "Section"), cell("", "Section")]),
     row([cell("Risk-free rate", "Label"), cell(assumptions.riskFreeRate.value, "Link", "='Assumptions'!R18C2", "Number")]),
-    row([cell("Relevered peer beta", "Label"), cell(assumptions.releveredBeta.value, "Link", "='Assumptions'!R20C2", "Number")]),
+    row([cell("Levered beta", "Label"), cell(assumptions.releveredBeta.value, "Link", "='Assumptions'!R20C2", "Number")]),
     row([cell("Equity risk premium", "Label"), cell(assumptions.equityRiskPremium.value, "Link", "='Assumptions'!R19C2", "Number")]),
     row([cell("Country risk premium", "Label"), cell(assumptions.countryRiskPremium.value, "Link", "='Assumptions'!R21C2", "Number")]),
     row([cell("Size premium", "Label"), cell(assumptions.sizePremium.value, "Link", "='Assumptions'!R22C2", "Number")]),
@@ -190,12 +194,12 @@ function waccSheet(assumptions: ProjectionAssumptions, result: DcfResult): strin
   return worksheet("WACC", rows, [220, 110]);
 }
 
-function valuationSheet(payload: ModelPayload, assumptions: ProjectionAssumptions, result: DcfResult): string {
+function valuationSheet(payload: ModelPayload, assumptions: ProjectionAssumptions, bridge: EquityBridge, result: DcfResult): string {
   const lastColumn = result.projections.length + 1;
   const terminalPeriodAdjustment = assumptions.discountingConvention === "mid-year" ? 0.5 : 0;
   const rows = [
     row([cell("VALUATION SUMMARY", "Title"), cell("", "Title")], 26),
-    row([cell(`${payload.identity.ticker} | ${payload.identity.name}`, "Note")]),
+    row([cell(`${payload.identity.ticker} | ${payload.identity.name} | Preliminary review-ready valuation`, "Note")]),
     row([cell("Terminal value", "Section"), cell("", "Section")]),
     row([cell("PV of explicit FCF", "Label"), cell(result.presentValueExplicitCashFlows, "Link", `=SUM('Projection Model'!R19C2:R19C${lastColumn})`, "Number")]),
     row([cell("Terminal value — Gordon", "Label"), cell(result.terminalValueGordon, "Formula", `=('Projection Model'!R10C${lastColumn}*(1+'Assumptions'!R13C2)*(1-'Assumptions'!R13C2/'Assumptions'!R14C2))/('WACC'!R14C2-'Assumptions'!R13C2)`, "Number")]),
@@ -206,15 +210,15 @@ function valuationSheet(payload: ModelPayload, assumptions: ProjectionAssumption
     row([cell("", "Body")]),
     row([cell("Enterprise-to-equity bridge", "Section"), cell("", "Section")]),
     row([cell("Enterprise value", "Label"), cell(result.enterpriseValueGordon, "Link", "=R[-5]C", "Number")]),
-    row([cell("+ Cash", "Label"), cell(payload.bridge.cash.value, "Link", "='Assumptions'!R32C2", "Number")]),
-    row([cell("+ Short-term investments", "Label"), cell(payload.bridge.shortTermInvestments.value, "Link", "='Assumptions'!R33C2", "Number")]),
-    row([cell("+ Equity-method investments", "Label"), cell(payload.bridge.equityMethodInvestments.value, "Link", "='Assumptions'!R39C2", "Number")]),
-    row([cell("+ PV of usable NOLs", "Label"), cell(payload.bridge.presentValueOfNols.value, "Link", "='Assumptions'!R40C2", "Number")]),
-    row([cell("- Total debt", "Label"), cell(payload.bridge.debt.value, "Link", "='Assumptions'!R34C2", "Number")]),
-    row([cell("- Finance lease liabilities", "Label"), cell(payload.bridge.financeLeaseLiabilities.value, "Link", "='Assumptions'!R35C2", "Number")]),
-    row([cell("- Operating lease liabilities", "Label"), cell(payload.bridge.operatingLeaseLiabilities.value, "Link", "='Assumptions'!R36C2", "Number")]),
-    row([cell("- Minority interest", "Label"), cell(payload.bridge.minorityInterest.value, "Link", "='Assumptions'!R37C2", "Number")]),
-    row([cell("- Preferred stock", "Label"), cell(payload.bridge.preferredStock.value, "Link", "='Assumptions'!R38C2", "Number")]),
+    row([cell("+ Cash", "Label"), cell(bridge.cash.value, "Link", "='Assumptions'!R32C2", "Number")]),
+    row([cell("+ Short-term investments", "Label"), cell(bridge.shortTermInvestments.value, "Link", "='Assumptions'!R33C2", "Number")]),
+    row([cell("+ Equity-method investments", "Label"), cell(bridge.equityMethodInvestments.value, "Link", "='Assumptions'!R39C2", "Number")]),
+    row([cell("+ PV of usable NOLs", "Label"), cell(bridge.presentValueOfNols.value, "Link", "='Assumptions'!R40C2", "Number")]),
+    row([cell("- Total debt", "Label"), cell(bridge.debt.value, "Link", "='Assumptions'!R34C2", "Number")]),
+    row([cell("- Finance lease liabilities", "Label"), cell(bridge.financeLeaseLiabilities.value, "Link", "='Assumptions'!R35C2", "Number")]),
+    row([cell("- Operating lease debt adjustment", "Label"), cell(bridge.operatingLeaseLiabilities.value, "Link", "='Assumptions'!R36C2", "Number")]),
+    row([cell("- Minority interest", "Label"), cell(bridge.minorityInterest.value, "Link", "='Assumptions'!R37C2", "Number")]),
+    row([cell("- Preferred stock", "Label"), cell(bridge.preferredStock.value, "Link", "='Assumptions'!R38C2", "Number")]),
     row([cell("Bridge adjustments", "Total"), cell(result.bridgeAdjustments, "Total", "=SUM(R[-9]C:R[-6]C)-SUM(R[-5]C:R[-1]C)", "Number")]),
     row([cell("Common equity value", "Total"), cell(result.commonEquityValueGordon, "Total", "=R[-11]C+R[-1]C", "Number")]),
     row([cell("Fully diluted shares", "Label"), cell(result.fullyDilutedShares, "Formula", "='Assumptions'!R41C2+IF('Assumptions'!R42C2>0,'Assumptions'!R42C2*(1-'Assumptions'!R43C2/'Assumptions'!R29C2),0)+'Assumptions'!R44C2", "Number")]),
@@ -283,24 +287,32 @@ function sourcesSheet(payload: ModelPayload, assumptions: ProjectionAssumptions,
   return worksheet("Sources Audit", rows, [180, 90, 75, 100, 420]);
 }
 
-function checksSheet(result: DcfResult): string {
+function checksSheet(payload: ModelPayload, assumptions: ProjectionAssumptions, result: DcfResult): string {
+  const reviewCount = payload.gaps.filter((gap) => gap.severity === "review").length;
+  const terminalGrowth = assumptions.terminalGrowth.value;
   const checks = [
-    ["No missing required inputs", result.errors.length, 0, result.errors.join(" | ")],
-    ["WACC exceeds terminal growth", result.wacc !== null ? 1 : 0, 1, "WACC must be formula-derived and valid."],
+    ["No critical model errors", result.errors.length, 0, result.errors.join(" | ")],
+    ["WACC exceeds terminal growth", result.wacc !== null && terminalGrowth !== null && result.wacc > terminalGrowth ? 1 : 0, 1, "WACC must exceed terminal growth for a valid Gordon-growth value."],
     ["Terminal value contribution below warning threshold", result.terminalValuePctEnterpriseValue ?? 1, 0.75, "Warning threshold only; a higher result requires review."],
     ["Per-share value is formula-derived", result.impliedSharePriceGordon === null ? 0 : 1, 1, "Must link through EV, bridge, and diluted shares."],
+    ["Review defaults outstanding", reviewCount, 0, "Review items do not block calculation; confirm or replace them before reliance."],
   ];
   const rows = [
     row([cell("CHECKS", "Title"), cell("", "Title"), cell("", "Title"), cell("", "Title"), cell("", "Title"), cell("", "Title")], 26),
     row([cell("Check", "Header"), cell("Actual", "Header"), cell("Expected / tolerance", "Header"), cell("Difference", "Header"), cell("Status", "Header"), cell("Notes", "Header")]),
-    ...checks.map(([label, actual, expected, notes], index) => row([
-      cell(label as string, "Label"),
-      cell(actual as number, "Formula", undefined, "Number"),
-      cell(expected as number, "Body", undefined, "Number"),
-      cell((actual as number) - (expected as number), "Formula", `=RC[-2]-RC[-1]`, "Number"),
-      cell(index === 2 ? ((actual as number) <= (expected as number) ? "OK" : "REVIEW") : ((actual as number) === (expected as number) ? "OK" : "FAIL"), "Check"),
-      cell(notes as string, "Note"),
-    ])),
+    ...checks.map(([label, actual, expected, notes], index) => {
+      const status = index === 2 || index === 4
+        ? ((actual as number) <= (expected as number) ? "OK" : "REVIEW")
+        : ((actual as number) === (expected as number) ? "OK" : "FAIL");
+      return row([
+        cell(label as string, "Label"),
+        cell(actual as number, "Formula", undefined, "Number"),
+        cell(expected as number, "Body", undefined, "Number"),
+        cell((actual as number) - (expected as number), "Formula", `=RC[-2]-RC[-1]`, "Number"),
+        cell(status, status === "OK" ? "Check" : status === "REVIEW" ? "Review" : "Missing"),
+        cell(notes as string, "Note"),
+      ]);
+    }),
   ];
   return worksheet("Checks", rows, [260, 80, 120, 85, 75, 300]);
 }
@@ -331,17 +343,18 @@ export function buildExcelXml(
   <Style ss:ID="Note"><Font ss:Size="8" ss:Color="#666666"/><Alignment ss:WrapText="1"/></Style>
   <Style ss:ID="Missing"><Font ss:Bold="1" ss:Color="#9C0006"/><Interior ss:Color="#FFC7CE" ss:Pattern="Solid"/></Style>
   <Style ss:ID="Check"><Font ss:Bold="1"/><Interior ss:Color="#D9EAD3" ss:Pattern="Solid"/></Style>
+  <Style ss:ID="Review"><Font ss:Bold="1" ss:Color="#7F6000"/><Interior ss:Color="#FFF2CC" ss:Pattern="Solid"/></Style>
   <Style ss:ID="Sensitivity"><NumberFormat ss:Format="$0.00"/><Interior ss:Color="#DCE6F1" ss:Pattern="Solid"/></Style>
   <Style ss:ID="SensitivityBase"><Font ss:Bold="1"/><NumberFormat ss:Format="$0.00"/><Interior ss:Color="#F4B183" ss:Pattern="Solid"/></Style>
 </Styles>
-${valuationSheet(payload, assumptions, result)}
+${valuationSheet(payload, assumptions, bridge, result)}
 ${assumptionsSheet(assumptions, payload, bridge)}
 ${historicalsSheet(payload)}
 ${projectionSheet(payload, assumptions, result)}
 ${waccSheet(assumptions, result)}
 ${sensitivitySheet(assumptions, result)}
 ${sourcesSheet(payload, assumptions, bridge)}
-${checksSheet(result)}
+${checksSheet(payload, assumptions, result)}
 </Workbook>`;
 }
 

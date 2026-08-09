@@ -16,6 +16,10 @@ function number(value: TaggedValue, label: string, errors: string[]): number | n
   return value.value;
 }
 
+function optionalNumber(value: TaggedValue): number | null {
+  return value.value !== null && Number.isFinite(value.value) ? value.value : null;
+}
+
 function series(
   values: TaggedValue[],
   length: number,
@@ -40,17 +44,31 @@ function bridgeValue(value: TaggedValue, label: string, errors: string[]): numbe
 
 function fullyDilutedShares(
   bridge: EquityBridge,
-  currentPrice: number,
+  currentPrice: number | null,
   errors: string[],
+  warnings: string[],
 ): number | null {
   const basic = bridgeValue(bridge.basicShares, "basic shares", errors);
   const options = bridgeValue(bridge.options, "options outstanding", errors);
   const strike = bridgeValue(bridge.optionStrikePrice, "weighted-average option strike", errors);
   const rsus = bridgeValue(bridge.rsus, "RSUs", errors);
   if ([basic, options, strike, rsus].some((value) => value === null)) return null;
-  const incrementalOptions = currentPrice > 0 && strike! < currentPrice
+  if (basic! <= 0) {
+    errors.push("Bridge item: basic shares must be greater than zero.");
+    return null;
+  }
+  if (options! < 0 || strike! < 0 || rsus! < 0) {
+    errors.push("Dilution inputs cannot be negative.");
+    return null;
+  }
+  const incrementalOptions = options! > 0 && currentPrice !== null && currentPrice > 0 && strike! < currentPrice
     ? options! * (1 - strike! / currentPrice)
-    : 0;
+    : options! > 0 && (currentPrice === null || currentPrice <= 0)
+      ? options!
+      : 0;
+  if (options! > 0 && (currentPrice === null || currentPrice <= 0)) {
+    warnings.push("Current market price was unavailable, so all outstanding options are included as a conservative dilution proxy.");
+  }
   return basic! + incrementalOptions + rsus!;
 }
 
@@ -95,6 +113,7 @@ export function calculateDcf(
     errors.push(payload.identity.ineligibleReason ?? "FCFF DCF is not appropriate for this issuer.");
   }
   if (!latest) errors.push("At least one annual filing period is required.");
+  if (annual.length > 0 && annual.length < 3) errors.push("At least three annual filing periods are required for the automatic FCFF case.");
   const projectionYears = assumptions.projectionYears;
   if (projectionYears < 5 || projectionYears > 10) {
     errors.push("Projection period must be between five and ten years.");
@@ -130,7 +149,7 @@ export function calculateDcf(
 
   const riskFree = number(assumptions.riskFreeRate, "Risk-free rate", errors);
   const erp = number(assumptions.equityRiskPremium, "Equity risk premium", errors);
-  const beta = number(assumptions.releveredBeta, "Relevered peer beta", errors);
+  const beta = number(assumptions.releveredBeta, "Levered beta", errors);
   const countryRisk = number(assumptions.countryRiskPremium, "Country risk premium", errors);
   const sizePremium = number(assumptions.sizePremium, "Size premium", errors);
   const costDebt = number(assumptions.preTaxCostOfDebt, "Pre-tax cost of debt", errors);
@@ -141,8 +160,10 @@ export function calculateDcf(
   const interestTaxRate = number(assumptions.usableInterestTaxRate, "Usable interest tax rate", errors);
   const terminalGrowth = number(assumptions.terminalGrowth, "Terminal growth", errors);
   const terminalRoic = number(assumptions.terminalRoic, "Terminal ROIC", errors);
-  const exitMultiple = number(assumptions.exitMultiple, "Exit EV/EBITDA multiple", errors);
-  const currentPrice = number(payload.market.currentPrice, "Current market price", errors);
+  const exitMultiple = optionalNumber(assumptions.exitMultiple);
+  const currentPrice = optionalNumber(payload.market.currentPrice);
+  if (exitMultiple === null) warnings.push("Exit-multiple cross-check is unavailable; the primary Gordon-growth valuation remains calculable.");
+  if (currentPrice === null) warnings.push("Current market price is unavailable; upside/downside is omitted.");
 
   const latestRevenue = latest ? number(latest.revenue, "Latest annual revenue", errors) : null;
   const latestNwc = latest
@@ -155,11 +176,15 @@ export function calculateDcf(
         latest.otherCurrentLiabilities.value,
       ]
     : [];
-  const latestNwcBalance = latestNwc.length && latestNwc.every((value) => value !== null)
+  let latestNwcBalance = latestNwc.length && latestNwc.every((value) => value !== null)
     ? (latestNwc[0]! + latestNwc[1]! + latestNwc[2]!)
       - (latestNwc[3]! + latestNwc[4]! + latestNwc[5]!)
     : null;
-  if (latestNwcBalance === null) errors.push("Latest operating working-capital components are incomplete.");
+  if (latestNwcBalance === null && latestRevenue !== null && nwcPercent?.[0] !== undefined) {
+    latestNwcBalance = latestRevenue * nwcPercent[0];
+    warnings.push("Latest operating working-capital components were incomplete, so the opening balance uses the normalized NWC/revenue assumption.");
+  }
+  if (latestNwcBalance === null) errors.push("Latest operating working-capital balance could not be resolved.");
 
   const costOfEquity = [riskFree, erp, beta, countryRisk, sizePremium].every((value) => value !== null)
     ? riskFree! + beta! * erp! + countryRisk! + sizePremium!
@@ -266,31 +291,33 @@ export function calculateDcf(
   let enterpriseValueExit: number | null = null;
   let terminalValuePctEnterpriseValue: number | null = null;
   if (finalProjection && wacc !== null && terminalGrowth !== null && terminalRoic !== null
-    && exitMultiple !== null && presentValueExplicitCashFlows !== null && wacc > terminalGrowth) {
+    && presentValueExplicitCashFlows !== null && wacc > terminalGrowth) {
     const terminalReinvestment = terminalGrowth / terminalRoic;
     const terminalNopat = finalProjection.nopat * (1 + terminalGrowth);
     const terminalFcf = terminalNopat * (1 - terminalReinvestment);
     terminalValueGordon = terminalFcf / (wacc - terminalGrowth);
     const finalEbitda = finalProjection.ebit + finalProjection.depreciationAmortization;
-    terminalValueExitMultiple = finalEbitda * exitMultiple;
     const terminalPeriod = finalProjection.discountPeriod
       + (assumptions.discountingConvention === "mid-year" ? 0.5 : 0);
     const terminalDiscountFactor = 1 / (1 + wacc) ** terminalPeriod;
     presentValueTerminalGordon = terminalValueGordon * terminalDiscountFactor;
-    presentValueTerminalExit = terminalValueExitMultiple * terminalDiscountFactor;
     enterpriseValueGordon = presentValueExplicitCashFlows + presentValueTerminalGordon;
-    enterpriseValueExit = presentValueExplicitCashFlows + presentValueTerminalExit;
     terminalValuePctEnterpriseValue = presentValueTerminalGordon / enterpriseValueGordon;
     impliedExitMultiple = finalEbitda !== 0 ? terminalValueGordon / finalEbitda : null;
-    impliedPerpetuityGrowth = bisection(
-      (candidateGrowth) => {
-        const reinvestment = candidateGrowth / terminalRoic;
-        const candidateFcf = finalProjection.nopat * (1 + candidateGrowth) * (1 - reinvestment);
-        return candidateFcf / (wacc - candidateGrowth) - terminalValueExitMultiple!;
-      },
-      -0.2,
-      Math.min(wacc, terminalRoic) - 1e-6,
-    );
+    if (exitMultiple !== null) {
+      terminalValueExitMultiple = finalEbitda * exitMultiple;
+      presentValueTerminalExit = terminalValueExitMultiple * terminalDiscountFactor;
+      enterpriseValueExit = presentValueExplicitCashFlows + presentValueTerminalExit;
+      impliedPerpetuityGrowth = bisection(
+        (candidateGrowth) => {
+          const reinvestment = candidateGrowth / terminalRoic;
+          const candidateFcf = finalProjection.nopat * (1 + candidateGrowth) * (1 - reinvestment);
+          return candidateFcf / (wacc - candidateGrowth) - terminalValueExitMultiple!;
+        },
+        -0.2,
+        Math.min(wacc, terminalRoic) - 1e-6,
+      );
+    }
     if (terminalValuePctEnterpriseValue > 0.75) {
       warnings.push("Terminal value exceeds 75% of enterprise value.");
     }
@@ -307,7 +334,7 @@ export function calculateDcf(
     equityMethodInvestments: bridgeValue(bridge.equityMethodInvestments, "equity-method investments", errors),
     nols: bridgeValue(bridge.presentValueOfNols, "present value of usable NOLs", errors),
   };
-  const fullyDiluted = currentPrice === null ? null : fullyDilutedShares(bridge, currentPrice, errors);
+  const fullyDiluted = fullyDilutedShares(bridge, currentPrice, errors, warnings);
   const completeBridge = Object.values(bridgeValues).every((value) => value !== null);
   const bridgeAdjustments = completeBridge
     ? bridgeValues.cash! + bridgeValues.shortTermInvestments! + bridgeValues.equityMethodInvestments!
