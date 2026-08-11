@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import ExcelJS from "exceljs";
+import { PDFDocument } from "pdf-lib";
 import { loadFmpFundamentals } from "../lib/data/fmp-fundamentals";
 import { buildModelPayload } from "../lib/data/model";
-import { buildExcelXml } from "../lib/export/excel-xml";
+import { buildExcelWorkbook } from "../lib/export/excel-xml";
 import { buildPdf } from "../lib/export/pdf";
 import type { ModelPayload, TaggedValue } from "../lib/model/types";
 import { buildUnleveredFreeCashFlow, calculateDcf } from "../lib/model/valuation";
@@ -95,13 +97,16 @@ function reviewReadyFixture(): ModelPayload {
     },
     bridge: {
       cash: tagged(100),
+      operatingCashRequirement: tagged(0),
       shortTermInvestments: tagged(20),
       debt: tagged(150),
       financeLeaseLiabilities: tagged(0),
       operatingLeaseLiabilities: tagged(0),
+      otherDebtLikeLiabilities: tagged(0),
       minorityInterest: tagged(0),
       preferredStock: tagged(0),
       equityMethodInvestments: tagged(0),
+      otherNonOperatingAssets: tagged(0),
       presentValueOfNols: tagged(0),
       basicShares: tagged(100),
       options: tagged(0),
@@ -176,20 +181,40 @@ test("missing market price uses conservative option dilution without blocking in
   assert.match(result.warnings.join(" | "), /all outstanding options are included/i);
 });
 
-test("exports preserve the review-ready status and the user's edited bridge", () => {
+test("economically invalid forecast and stable-state assumptions block the calculation", () => {
+  const payload = reviewReadyFixture();
+  payload.assumptions.revenueGrowth[0] = tagged(-1.05, "Invalid growth");
+  payload.assumptions.terminalGrowth = tagged(0.06, "Invalid terminal growth");
+  payload.assumptions.terminalRoic = tagged(0.05, "Invalid terminal ROIC");
+  const result = calculateDcf(payload);
+  assert.equal(result.ready, false);
+  assert.match(result.errors.join(" | "), /Revenue growth in forecast year 1/i);
+  assert.match(result.errors.join(" | "), /Terminal ROIC must exceed terminal growth/i);
+});
+
+test("exports are genuine, review-controlled Office files and preserve the edited bridge", async () => {
   const payload = reviewReadyFixture();
   const editedBridge = structuredClone(payload.bridge);
   editedBridge.cash = tagged(777, "Edited cash");
   const result = calculateDcf(payload, payload.assumptions, editedBridge);
-  const excelXml = buildExcelXml(payload, payload.assumptions, editedBridge, result);
-  const pdfText = new TextDecoder().decode(buildPdf(payload, payload.assumptions, result));
+  const excelBytes = await buildExcelWorkbook(payload, payload.assumptions, editedBridge, result);
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(Buffer.from(excelBytes) as unknown as Parameters<typeof workbook.xlsx.load>[0]);
+  const valuation = workbook.getWorksheet("Valuation Summary");
+  const assumptions = workbook.getWorksheet("Assumptions");
+  assert.ok(valuation);
+  assert.ok(assumptions);
+  assert.equal(workbook.worksheets.length, 9);
+  assert.equal(valuation.getCell("B44").value && typeof valuation.getCell("B44").value === "object" ? (valuation.getCell("B44").value as ExcelJS.CellFormulaValue).formula : null, "B37/B43");
+  const cashRow = assumptions.getColumn(1).values.findIndex((value) => value === "Cash and equivalents");
+  assert.ok(cashRow > 0);
+  assert.equal(assumptions.getCell(cashRow, 2).value, 777);
+  assert.equal(new TextDecoder().decode(excelBytes.slice(0, 2)), "PK");
 
-  assert.match(excelXml, /Preliminary review-ready valuation/);
-  assert.match(excelXml, /Operating lease debt adjustment/);
-  assert.match(excelXml, /Review defaults outstanding/);
-  assert.match(excelXml, /<Data ss:Type="Number">777<\/Data>/);
-  assert.match(pdfText, /Model status: preliminary valuation ready/i);
-  assert.match(pdfText, /1 review item/);
+  const pdfBytes = await buildPdf(payload, payload.assumptions, result);
+  const pdf = await PDFDocument.load(pdfBytes);
+  assert.equal(pdf.getPageCount(), 3);
+  assert.equal(new TextDecoder().decode(pdfBytes.slice(0, 5)), "%PDF-");
 });
 
 test("automatic FMP fallback produces a complete review-ready valuation", async () => {
@@ -281,10 +306,14 @@ test("automatic FMP fallback produces a complete review-ready valuation", async 
     assert.ok(result.impliedSharePriceGordon !== null && result.impliedSharePriceGordon > 0);
     assert.equal(payload.assumptions.revenueGrowth.slice(0, 3).every((value) => value.provenance.sourceUrl?.includes("analyst-estimates")), true);
     assert.equal(payload.assumptions.terminalGrowth.value, 0.025);
+    assert.ok((payload.assumptions.preTaxCostOfDebt.value ?? 0) >= (payload.assumptions.riskFreeRate.value ?? 0) + 0.015 - 1e-10);
+    assert.equal(payload.assumptions.exitMultiple.value, null);
     assert.equal(payload.bridge.operatingLeaseLiabilities.value, 0);
+    assert.equal(payload.bridge.operatingCashRequirement.value, 0);
     assert.equal(payload.bridge.presentValueOfNols.value, 0);
     assert.ok((payload.bridge.rsus.value ?? 0) > 0);
     assert.ok(payload.gaps.some((gap) => gap.severity === "review"));
+    assert.ok(result.terminalFreeCashFlow !== null && result.terminalFreeCashFlow > 0);
     const fmpRequests = requestedUrls.filter((url) => url.hostname === "financialmodelingprep.com");
     assert.ok(fmpRequests.length <= 17, `Expected a bounded automatic-case request count, received ${fmpRequests.length}.`);
   } finally {

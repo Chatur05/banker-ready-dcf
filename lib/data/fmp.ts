@@ -4,6 +4,8 @@ import type { AnalystEstimate, MarketInputs, TaggedValue } from "../model/types"
 const FMP_BASE = "https://financialmodelingprep.com/stable";
 const CACHE_TTL = 30 * 60 * 1000;
 const memoryCache = new Map<string, { expires: number; value: unknown }>();
+const inFlight = new Map<string, Promise<unknown>>();
+let planLimitCircuitUntil = 0;
 
 function missing(label: string, units: string, notes: string): TaggedValue {
   return { value: null, provenance: { origin: "missing", label, units, notes } };
@@ -33,13 +35,13 @@ function sourced(
   };
 }
 
-export async function fetchFmp<T>(path: string, params: Record<string, string> = {}): Promise<T> {
+async function requestFmp<T>(path: string, params: Record<string, string>, cacheKey: string): Promise<T> {
   const apiKey = process.env.FMP_API_KEY;
   if (!apiKey) throw new Error("FMP_API_KEY is not configured.");
+  if (planLimitCircuitUntil > Date.now()) {
+    throw new Error("FMP plan limit was recently reached; requests are temporarily paused to avoid consuming additional quota.");
+  }
   const query = new URLSearchParams(params);
-  const cacheKey = `${path}?${query.toString()}`;
-  const cached = memoryCache.get(cacheKey);
-  if (cached && cached.expires > Date.now()) return cached.value as T;
   query.set("apikey", apiKey);
   let lastError: Error | null = null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -53,7 +55,12 @@ export async function fetchFmp<T>(path: string, params: Record<string, string> =
         memoryCache.set(cacheKey, { expires: Date.now() + CACHE_TTL, value });
         return value;
       }
-      lastError = new Error(`FMP request failed (${response.status}) for ${path}`);
+      const responseText = await response.text();
+      const planLimit = /plan|limit.*reached|upgrade|subscription/i.test(responseText);
+      if (planLimit) planLimitCircuitUntil = Date.now() + 15 * 60 * 1000;
+      const safeDetail = responseText.replaceAll(apiKey, "[redacted]").replace(/\s+/g, " ").slice(0, 220);
+      lastError = new Error(`FMP request failed (${response.status}) for ${path}${safeDetail ? `: ${safeDetail}` : ""}`);
+      if (planLimit) break;
       if (response.status !== 429 && response.status < 500) break;
       if (attempt === 2) break;
       const retryAfter = Number(response.headers.get("Retry-After"));
@@ -67,6 +74,18 @@ export async function fetchFmp<T>(path: string, params: Record<string, string> =
     }
   }
   throw lastError ?? new Error(`FMP request failed for ${path}`);
+}
+
+export async function fetchFmp<T>(path: string, params: Record<string, string> = {}): Promise<T> {
+  const query = new URLSearchParams(params);
+  const cacheKey = `${path}?${query.toString()}`;
+  const cached = memoryCache.get(cacheKey);
+  if (cached && cached.expires > Date.now()) return cached.value as T;
+  const pending = inFlight.get(cacheKey);
+  if (pending) return pending as Promise<T>;
+  const request = requestFmp<T>(path, params, cacheKey).finally(() => inFlight.delete(cacheKey));
+  inFlight.set(cacheKey, request);
+  return request;
 }
 
 export function marketInputsUnavailable(reason: string): MarketInputs {
@@ -180,7 +199,7 @@ export async function loadFmpMarketInputs(ticker: string): Promise<MarketInputs>
       const peerMultiple = await peerExitMultiple(symbol);
       if (peerMultiple !== null && peerMultiple > 0 && peerMultiple <= 50) exitMultiples.push(peerMultiple);
     } catch {
-      // A failed peer is excluded; the model can fall back to subject-company EV/EBITDA.
+      // A failed peer is excluded; the exit-method cross-check remains unavailable rather than circular.
     }
   }
   const quotePrice = numeric(quote, ["price"]);

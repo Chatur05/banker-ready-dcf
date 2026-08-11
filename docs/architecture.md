@@ -10,7 +10,7 @@ Use a hybrid, provenance-first data architecture:
 - Direct filing documents remain the authoritative review source for disclosures that are not reliably standardized in Company Facts, including options, RSUs, lease details, preferred stock, NCI, and non-operating investments. Missing optional detail receives a conservative, explicitly labeled review default so the preliminary valuation can still calculate.
 - If the SEC data host is unreachable, the server may use FMP standardized filing statements as a flagged fallback. The audit trail retains the linked filing and warns the reviewer to reconcile material values before relying on the output.
 - Financial Modeling Prep (FMP) Stable API supplies standardized filing fallback data, analyst estimates, current prices and shares, peer suggestions, Treasury rates, and market risk premium. The key is held server-side as `FMP_API_KEY`; it is never exposed to the browser or workbook.
-- Every value is represented as sourced, derived, review-assumed, or missing and carries a source URL, as-of/filing date, fiscal period, units, and review/gap status.
+- Every value is represented as sourced, derived, review-assumed, user-entered, or missing and carries a source URL, as-of/filing date, fiscal period, units, and review/gap status.
 - The automatic case follows a fixed hierarchy: user override, sourced filing/market value, derived value, then labeled house default. Only eligibility, minimum-history, share-count, and mathematical-integrity failures block the preliminary Gordon value.
 
 ## Architecture fork
@@ -45,7 +45,7 @@ Coverage: SEC retains filing-grade provenance when accessible, with FMP standard
 
 Depth and fiscal handling: SEC provides the historical depth and fiscal-period fidelity. FMP provides price history, quote, peers, Treasury, and ERP endpoints through its supported Stable API.
 
-Rate limits and cost: Requests are cached and bounded. Optional FMP endpoints degrade to review defaults independently, and transient rate-limit or server failures receive bounded retry rather than causing the entire market-input bundle to fail.
+Rate limits and cost: Requests are cached, coalesced, and bounded. Optional FMP endpoints degrade to review defaults independently. Transient rate-limit or server failures receive bounded retry, while provider plan-limit responses open a temporary circuit breaker rather than consuming additional quota.
 
 Reviewer credentials: Reviewers of the deployed application need no credentials because the key remains server-side. If a market endpoint is unavailable, the app uses a visible house default and omits only source-dependent comparisons such as market upside/downside.
 
@@ -56,8 +56,8 @@ Why selected: It preserves filing-level auditability while producing a useful fi
 - TypeScript and React using the Sites/vinext starter for Cloudflare Worker-compatible deployment.
 - Server-side data adapters for SEC and FMP with explicit schemas, timeouts, caching, and structured error states.
 - A pure TypeScript valuation engine shared by the UI, tests, and exports.
-- Runtime Excel XML export with live cross-sheet formulas linking Assumptions, Historicals, Projection Model, WACC, Sensitivities, Valuation Summary, Sources/Audit, and Checks.
-- PDF one-pager rendered from the same typed valuation result so the app, workbook, and PDF cannot drift.
+- Runtime genuine `.xlsx` export with typed cells and live cross-sheet formulas linking Cover, Assumptions, Historicals, Projection Model, WACC, Sensitivities, Valuation Summary, Sources/Audit, and Checks.
+- A three-page PDF review pack rendered from the same typed valuation result, including the per-share conclusion, FCFF build, bridge, critical checks, and complete review queue.
 
 ## Current primary documentation checked
 
@@ -74,6 +74,9 @@ Why selected: It preserves filing-level auditability while producing a useful fi
 - No valuation when `WACC <= terminal growth`.
 - No valuation without at least three annual periods or a positive common-share count.
 - Gordon growth calculates independently of the exit-multiple cross-check.
+- The subject company's own trading multiple is never used as its terminal exit assumption. The exit case requires a defensible peer median or explicit user input.
+- Historical interest / average debt is floored at risk-free plus a transparent 150 bps review spread when it would imply an implausibly low marginal borrowing cost.
+- Calculation completion and circulation readiness are separate statuses; unresolved judgment and source flags remain visible in every output.
 - Missing award-level dilution uses the latest reported diluted/basic share relationship; detailed awards replace the proxy when available.
 - Operating lease liabilities are not subtracted in an unadjusted-FCFF case. Lease debt is included only when the operating forecast is adjusted consistently.
 - Conservative zero defaults for optional bridge assets or claims are labeled for review and never presented as sourced.

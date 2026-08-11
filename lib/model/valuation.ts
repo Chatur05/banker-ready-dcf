@@ -38,6 +38,33 @@ function series(
   return parsed as number[];
 }
 
+function validateRange(
+  values: number[] | null,
+  label: string,
+  low: number,
+  high: number,
+  errors: string[],
+): void {
+  if (!values) return;
+  values.forEach((value, index) => {
+    if (value < low || value > high) {
+      errors.push(`${label} in forecast year ${index + 1} must be between ${(low * 100).toFixed(0)}% and ${(high * 100).toFixed(0)}%.`);
+    }
+  });
+}
+
+function validateScalarRange(
+  value: number | null,
+  label: string,
+  low: number,
+  high: number,
+  errors: string[],
+): void {
+  if (value !== null && (value < low || value > high)) {
+    errors.push(`${label} must be between ${(low * 100).toFixed(0)}% and ${(high * 100).toFixed(0)}%.`);
+  }
+}
+
 function bridgeValue(value: TaggedValue, label: string, errors: string[]): number | null {
   return number(value, `Bridge item: ${label}`, errors);
 }
@@ -146,6 +173,13 @@ export function calculateDcf(
     errors,
   );
   const taxRates = series(assumptions.operatingTaxRate, projectionYears, "Operating tax rate", errors);
+  validateRange(growth, "Revenue growth", -0.95, 1, errors);
+  validateRange(margins, "EBIT margin", -1, 1, errors);
+  validateRange(daPercent, "D&A / revenue", 0, 1, errors);
+  validateRange(sbcPercent, "SBC / revenue", 0, 1, errors);
+  validateRange(capexPercent, "Capex / revenue", 0, 1, errors);
+  validateRange(nwcPercent, "NWC / revenue", -1, 1, errors);
+  validateRange(taxRates, "Operating tax rate", 0, 0.60, errors);
 
   const riskFree = number(assumptions.riskFreeRate, "Risk-free rate", errors);
   const erp = number(assumptions.equityRiskPremium, "Equity risk premium", errors);
@@ -164,6 +198,20 @@ export function calculateDcf(
   const currentPrice = optionalNumber(payload.market.currentPrice);
   if (exitMultiple === null) warnings.push("Exit-multiple cross-check is unavailable; the primary Gordon-growth valuation remains calculable.");
   if (currentPrice === null) warnings.push("Current market price is unavailable; upside/downside is omitted.");
+  validateScalarRange(riskFree, "Risk-free rate", -0.02, 0.25, errors);
+  validateScalarRange(erp, "Equity risk premium", 0, 0.25, errors);
+  validateScalarRange(countryRisk, "Country risk premium", 0, 0.25, errors);
+  validateScalarRange(sizePremium, "Size premium", 0, 0.25, errors);
+  validateScalarRange(costDebt, "Pre-tax cost of debt", 0, 0.40, errors);
+  validateScalarRange(interestTaxRate, "Usable interest tax rate", 0, 0.60, errors);
+  validateScalarRange(terminalGrowth, "Terminal growth", -0.05, 0.10, errors);
+  validateScalarRange(terminalRoic, "Terminal ROIC", 0.01, 1, errors);
+  for (const [label, value] of [["Debt weight", debtWeight], ["Equity weight", equityWeight], ["Preferred weight", preferredWeight]] as Array<[string, number | null]>) {
+    validateScalarRange(value, label, 0, 1, errors);
+  }
+  if (beta !== null && (beta < 0 || beta > 5)) errors.push("Levered beta must be between 0.0x and 5.0x.");
+  if (preferredCost !== null && (preferredCost < 0 || preferredCost > 0.40)) errors.push("Preferred cost must be between 0% and 40%.");
+  if (exitMultiple !== null && (exitMultiple <= 0 || exitMultiple > 50)) errors.push("Exit EV / EBITDA must be greater than 0.0x and no more than 50.0x.");
 
   const latestRevenue = latest ? number(latest.revenue, "Latest annual revenue", errors) : null;
   const latestNwc = latest
@@ -213,6 +261,10 @@ export function calculateDcf(
   if (terminalRoic !== null && terminalGrowth !== null && terminalRoic <= terminalGrowth) {
     errors.push("Terminal ROIC must exceed terminal growth to support a valid reinvestment rate.");
   }
+  if (terminalRoic !== null && terminalGrowth !== null && terminalGrowth >= 0
+    && terminalGrowth / terminalRoic > 1) {
+    errors.push("Terminal reinvestment cannot exceed 100% of NOPAT in a positive-growth stable state.");
+  }
 
   const canProject = latest && latestRevenue !== null && latestNwcBalance !== null
     && growth && margins && daPercent && sbcPercent && capexPercent && nwcPercent && taxRates
@@ -225,8 +277,11 @@ export function calculateDcf(
       return candidate;
     })();
     const firstStubFraction = Math.min(1, yearFraction(assumptions.valuationDate, nextFiscalEnd));
+    if (firstStubFraction < 0.75) {
+      warnings.push(`The first forecast period is a ${(firstStubFraction * 100).toFixed(1)}% stub estimated from a full-year operating case; reconcile reported interim actuals before circulation.`);
+    }
     let priorRevenue = latestRevenue;
-    let priorNwc = latestNwcBalance;
+    let priorNwc = latestNwcBalance!;
     for (let index = 0; index < projectionYears; index += 1) {
       const revenue = priorRevenue * (1 + growth[index]);
       const ebit = revenue * margins[index];
@@ -267,6 +322,7 @@ export function calculateDcf(
         netWorkingCapital,
         changeInNetWorkingCapital,
         unleveredFreeCashFlow,
+        fullYearUnleveredFreeCashFlow: fullYearFcf,
         stubFraction,
         discountPeriod,
         discountFactor,
@@ -290,16 +346,21 @@ export function calculateDcf(
   let enterpriseValueGordon: number | null = null;
   let enterpriseValueExit: number | null = null;
   let terminalValuePctEnterpriseValue: number | null = null;
+  let terminalNopat: number | null = null;
+  let terminalReinvestmentRate: number | null = null;
+  let terminalFreeCashFlow: number | null = null;
+  let terminalDiscountPeriod: number | null = null;
+  let terminalDiscountFactor: number | null = null;
   if (finalProjection && wacc !== null && terminalGrowth !== null && terminalRoic !== null
     && presentValueExplicitCashFlows !== null && wacc > terminalGrowth) {
-    const terminalReinvestment = terminalGrowth / terminalRoic;
-    const terminalNopat = finalProjection.nopat * (1 + terminalGrowth);
-    const terminalFcf = terminalNopat * (1 - terminalReinvestment);
-    terminalValueGordon = terminalFcf / (wacc - terminalGrowth);
+    terminalReinvestmentRate = terminalGrowth / terminalRoic;
+    terminalNopat = finalProjection.nopat * (1 + terminalGrowth);
+    terminalFreeCashFlow = terminalNopat * (1 - terminalReinvestmentRate);
+    terminalValueGordon = terminalFreeCashFlow / (wacc - terminalGrowth);
     const finalEbitda = finalProjection.ebit + finalProjection.depreciationAmortization;
-    const terminalPeriod = finalProjection.discountPeriod
+    terminalDiscountPeriod = finalProjection.discountPeriod
       + (assumptions.discountingConvention === "mid-year" ? 0.5 : 0);
-    const terminalDiscountFactor = 1 / (1 + wacc) ** terminalPeriod;
+    terminalDiscountFactor = 1 / (1 + wacc) ** terminalDiscountPeriod;
     presentValueTerminalGordon = terminalValueGordon * terminalDiscountFactor;
     enterpriseValueGordon = presentValueExplicitCashFlows + presentValueTerminalGordon;
     terminalValuePctEnterpriseValue = presentValueTerminalGordon / enterpriseValueGordon;
@@ -325,21 +386,26 @@ export function calculateDcf(
 
   const bridgeValues = {
     cash: bridgeValue(bridge.cash, "cash and equivalents", errors),
+    operatingCashRequirement: bridgeValue(bridge.operatingCashRequirement, "operating cash requirement", errors),
     shortTermInvestments: bridgeValue(bridge.shortTermInvestments, "short-term investments", errors),
     debt: bridgeValue(bridge.debt, "total debt", errors),
     financeLeases: bridgeValue(bridge.financeLeaseLiabilities, "finance lease liabilities", errors),
     operatingLeases: bridgeValue(bridge.operatingLeaseLiabilities, "operating lease liabilities", errors),
+    otherDebtLikeLiabilities: bridgeValue(bridge.otherDebtLikeLiabilities, "other debt-like liabilities", errors),
     minorityInterest: bridgeValue(bridge.minorityInterest, "minority interest", errors),
     preferredStock: bridgeValue(bridge.preferredStock, "preferred stock", errors),
     equityMethodInvestments: bridgeValue(bridge.equityMethodInvestments, "equity-method investments", errors),
+    otherNonOperatingAssets: bridgeValue(bridge.otherNonOperatingAssets, "other non-operating assets", errors),
     nols: bridgeValue(bridge.presentValueOfNols, "present value of usable NOLs", errors),
   };
   const fullyDiluted = fullyDilutedShares(bridge, currentPrice, errors, warnings);
   const completeBridge = Object.values(bridgeValues).every((value) => value !== null);
   const bridgeAdjustments = completeBridge
-    ? bridgeValues.cash! + bridgeValues.shortTermInvestments! + bridgeValues.equityMethodInvestments!
+    ? bridgeValues.cash! - bridgeValues.operatingCashRequirement! + bridgeValues.shortTermInvestments!
+      + bridgeValues.equityMethodInvestments! + bridgeValues.otherNonOperatingAssets!
       + bridgeValues.nols! - bridgeValues.debt! - bridgeValues.financeLeases!
-      - bridgeValues.operatingLeases! - bridgeValues.minorityInterest! - bridgeValues.preferredStock!
+      - bridgeValues.operatingLeases! - bridgeValues.otherDebtLikeLiabilities!
+      - bridgeValues.minorityInterest! - bridgeValues.preferredStock!
     : null;
   const commonEquityValueGordon = enterpriseValueGordon !== null && bridgeAdjustments !== null
     ? enterpriseValueGordon + bridgeAdjustments
@@ -375,6 +441,11 @@ export function calculateDcf(
     enterpriseValueGordon,
     enterpriseValueExit,
     terminalValuePctEnterpriseValue,
+    terminalNopat,
+    terminalReinvestmentRate,
+    terminalFreeCashFlow,
+    terminalDiscountPeriod,
+    terminalDiscountFactor,
     commonEquityValueGordon,
     commonEquityValueExit,
     fullyDilutedShares: fullyDiluted,

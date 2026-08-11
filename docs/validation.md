@@ -1,6 +1,6 @@
 # Validation and Reconciliation Record
 
-Validation date: 2026-08-09
+Validation date: 2026-08-11
 
 ## Status
 
@@ -8,9 +8,11 @@ The calculation engine, production build, invalid-input refusal, and an Apple fi
 
 Live extraction was verified for AAPL and MSFT on 2026-08-09. Direct requests from the app process to the SEC data host still return HTTP 403, so the run used the disclosed FMP filing fallback. The configured FMP statement entitlement permits at most five annual periods; the fallback adapter and regression suite enforce that limit.
 
-The automatic case now calculates a preliminary Gordon-growth per-share value without manual data entry. Available analyst consensus drives the first three forecast years and then fades toward mature-state growth and margins. Terminal growth, terminal ROIC, lease treatment, NOL value, and dilution fallbacks remain visible review items. The exit-multiple method is an independent cross-check and can be absent without suppressing the primary intrinsic value.
+The automatic case now calculates a preliminary Gordon-growth per-share value without manual data entry while explicitly separating calculation integrity from circulation readiness. Available analyst consensus drives the first three forecast years and then fades toward mature-state growth and margins. Terminal growth, terminal ROIC, interim/stub integration, lease treatment, operating cash, NOL value, other debt-like claims and dilution fallbacks remain visible review items. The exit-multiple method is an independent peer-based cross-check and can be absent without suppressing the primary intrinsic value; the subject's own trading multiple is never substituted.
 
-The regression suite verifies that Gordon growth completes without an exit multiple or current market price, that missing price data uses conservative option dilution without blocking intrinsic value, that stock compensation treatment remains explicit, and that the Apple operating build still ties to sourced filing arithmetic. A live AAPL automatic case completed with five annual periods, three consensus forecast years, no critical model errors, and a formula-derived per-share value before the configured FMP key reached its plan limit during repeated validation calls.
+The regression suite verifies that Gordon growth completes without an exit multiple or current market price, missing price data uses conservative option dilution without blocking intrinsic value, stock compensation treatment remains explicit, economically impossible forecast/stable-state inputs block calculation, and the Apple operating build still ties to sourced filing arithmetic. A live AAPL automatic case completed on 2026-08-11 with five annual periods, three consensus forecast years, no critical model errors, a 9.45% WACC, and a formula-derived Gordon value of $134.72 per share.
+
+The generated AAPL workbook was opened in Microsoft Excel for Microsoft 365, fully recalculated, scanned across every used cell for formula errors, saved, and rendered to PDF. All nine worksheets opened successfully; `Valuation Summary!B44` retained the live formula `=B37/B43`, recalculated to $134.716606562716, and exactly matched the application result. No `#REF!`, `#VALUE!`, `#DIV/0!`, `#NAME?`, `#N/A`, `#NUM!`, or `#NULL!` values were found. The standalone PDF review pack and the Excel print rendering were rendered to PNG and visually inspected for clipping, overlap, alignment, legibility, page hierarchy, and footer consistency.
 
 ## Apple FY2025 filing reconciliation
 
@@ -83,9 +85,10 @@ The automated test uses only Apple FY2025/FY2024 filing values. It constructs op
 
 The engine result ties to the independently written arithmetic within less than $0.000001mm. Stock-based compensation remains excluded from the add-back by default; enabling the explicit toggle increases FCF by exactly the sourced SBC amount.
 
-## Items not yet verified
+## Retained limitations
 
 - Five-year context selection and latest-quarter normalization through the primary SEC adapter in the deployed runtime; the SEC host currently returns HTTP 403 there.
 - A repeat live Microsoft automatic-case smoke test after the latest low-call market-input optimization; the configured FMP key reached its plan limit during repeated validation requests.
 - Company-specific award-level dilution and lease-note parsing through the primary SEC adapter in the deployed runtime.
-- Spreadsheet recalculation in desktop Excel; the export formulas are structurally tested and still require a final open/recalculate check on a complete, sourced model.
+- The automatic model is a review-required top-down FCFF screen, not a fully integrated three-statement transaction model with issuer-specific PP&E, tax, debt, lease and share-count schedules.
+- The two development-only `image-size` denial-of-service advisories inherited through vinext remain upstream with no patched package version reported by npm on the validation date; production dependencies audit with zero known vulnerabilities and the application does not accept user-supplied images.

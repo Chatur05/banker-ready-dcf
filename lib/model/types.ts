@@ -1,4 +1,4 @@
-export type ValueOrigin = "sourced" | "derived" | "assumed" | "missing";
+export type ValueOrigin = "sourced" | "derived" | "assumed" | "user" | "missing";
 
 export type Provenance = {
   origin: ValueOrigin;
@@ -149,13 +149,16 @@ export type ProjectionAssumptions = {
 
 export type EquityBridge = {
   cash: TaggedValue;
+  operatingCashRequirement: TaggedValue;
   shortTermInvestments: TaggedValue;
   debt: TaggedValue;
   financeLeaseLiabilities: TaggedValue;
   operatingLeaseLiabilities: TaggedValue;
+  otherDebtLikeLiabilities: TaggedValue;
   minorityInterest: TaggedValue;
   preferredStock: TaggedValue;
   equityMethodInvestments: TaggedValue;
+  otherNonOperatingAssets: TaggedValue;
   presentValueOfNols: TaggedValue;
   basicShares: TaggedValue;
   options: TaggedValue;
@@ -188,6 +191,7 @@ export type ProjectionYear = {
   netWorkingCapital: number;
   changeInNetWorkingCapital: number;
   unleveredFreeCashFlow: number;
+  fullYearUnleveredFreeCashFlow: number;
   stubFraction: number;
   discountPeriod: number;
   discountFactor: number;
@@ -212,6 +216,11 @@ export type DcfResult = {
   enterpriseValueGordon: number | null;
   enterpriseValueExit: number | null;
   terminalValuePctEnterpriseValue: number | null;
+  terminalNopat: number | null;
+  terminalReinvestmentRate: number | null;
+  terminalFreeCashFlow: number | null;
+  terminalDiscountPeriod: number | null;
+  terminalDiscountFactor: number | null;
   commonEquityValueGordon: number | null;
   commonEquityValueExit: number | null;
   fullyDilutedShares: number | null;

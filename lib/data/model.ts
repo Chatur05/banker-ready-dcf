@@ -275,6 +275,12 @@ export async function buildModelPayload(ticker: string): Promise<ModelPayload> {
   }
 
   const cash = reviewDefault(latest?.cash, 0, "Cash and equivalents", "$mm", "No usable standardized cash balance was returned; zero is conservative in the equity bridge.");
+  const operatingCashRequirement = assumed(
+    0,
+    "Operating cash requirement",
+    "$mm",
+    "Review default: zero. Enter cash required to run the business; only cash above this amount is treated as excess in the equity bridge.",
+  );
   const shortTermInvestments = reviewDefault(latest?.shortTermInvestments, 0, "Short-term investments", "$mm", "No separately identified short-term investment balance was returned.");
   const debt = reviewDefault(latest?.totalDebt, 0, "Total debt", "$mm", "No funded-debt balance was returned from the standardized statements.");
   const financeLeaseLiabilities = reviewDefault(latest?.financeLeaseLiabilities, 0, "Finance lease liabilities", "$mm", "No separately identified finance-lease liability was returned.");
@@ -284,9 +290,21 @@ export async function buildModelPayload(ticker: string): Promise<ModelPayload> {
     "$mm",
     `Review default: zero in the unadjusted-FCFF method because lease expense remains in operating cash flow.${latest?.operatingLeaseLiabilities.value ? ` A reported liability of ${latest.operatingLeaseLiabilities.value.toFixed(1)}mm is available if the forecast is lease-adjusted consistently.` : ""}`,
   );
+  const otherDebtLikeLiabilities = assumed(
+    0,
+    "Other debt-like liabilities",
+    "$mm",
+    "Review default: zero. Add unfunded pensions, restructuring reserves, environmental obligations, deferred consideration, or other debt-like claims when material.",
+  );
   const minorityInterest = reviewDefault(latest?.minorityInterest, 0, "Minority interest", "$mm", "No noncontrolling-interest balance was returned; confirm against the latest balance sheet.");
   const preferredStock = reviewDefault(latest?.preferredStock, 0, "Preferred stock", "$mm", "No preferred-equity balance was returned; confirm against the latest balance sheet.");
-  const equityMethodInvestments = reviewDefault(latest?.equityMethodInvestments, 0, "Equity-method investments", "$mm", "No separately valued equity-method investment balance was returned.");
+  const equityMethodInvestments = reviewDefault(latest?.equityMethodInvestments, 0, "Non-operating investments", "$mm", "No separately valued non-operating investment balance was returned; confirm classification and value against the filing.");
+  const otherNonOperatingAssets = assumed(
+    0,
+    "Other non-operating assets",
+    "$mm",
+    "Review default: zero. Add separately valued assets excluded from operating enterprise value only when they are not already captured elsewhere.",
+  );
   const nolValue = assumed(
     0,
     "Present value of usable NOLs",
@@ -329,13 +347,16 @@ export async function buildModelPayload(ticker: string): Promise<ModelPayload> {
       );
   const bridge: EquityBridge = {
     cash,
+    operatingCashRequirement,
     shortTermInvestments,
     debt,
     financeLeaseLiabilities,
     operatingLeaseLiabilities,
+    otherDebtLikeLiabilities,
     minorityInterest,
     preferredStock,
     equityMethodInvestments,
+    otherNonOperatingAssets,
     presentValueOfNols: nolValue,
     basicShares,
     options,
@@ -436,36 +457,38 @@ export async function buildModelPayload(ticker: string): Promise<ModelPayload> {
   };
   const equityWeight = derived(1 - debtWeightValue - preferredWeightValue, "Equity weight", "%", "Residual capital weight after debt and preferred equity.", debtWeight);
   const historicalDebtCost = latestDebtCost(annual);
+  const marginalDebtCostFloor = Math.max(0, (riskFreeRate.value ?? 0.04) + 0.015);
   const preTaxCostOfDebt = debtWeightValue === 0
     ? derived(0, "Pre-tax cost of debt", "%", "Not applicable because the selected debt weight is zero.", debt)
-    : reviewDefault(
-        historicalDebtCost,
-        Math.max(0.05, (riskFreeRate.value ?? 0.04) + 0.015),
-        "Pre-tax cost of debt",
-        "%",
-        "Risk-free rate plus a 150 bps review spread, floored at 5.0%, is used because a stable historical borrowing rate was unavailable.",
-      );
+    : historicalDebtCost.value !== null
+      ? derived(
+          Math.max(historicalDebtCost.value, marginalDebtCostFloor),
+          "Pre-tax cost of debt",
+          "%",
+          historicalDebtCost.value < marginalDebtCostFloor
+            ? `Historical interest / average debt (${(historicalDebtCost.value * 100).toFixed(2)}%) is below a plausible marginal borrowing rate, so the automatic case uses risk-free plus a transparent 150 bps review spread (${(marginalDebtCostFloor * 100).toFixed(2)}%). Replace with a current traded yield or synthetic rating spread.`
+            : "Historical interest / average debt exceeds the risk-free-plus-150-bps floor and is used only as an editable proxy for marginal borrowing cost.",
+          historicalDebtCost,
+        )
+      : assumed(
+          marginalDebtCostFloor,
+          "Pre-tax cost of debt",
+          "%",
+          "Review default: risk-free rate plus a 150 bps spread because no stable historical borrowing-rate proxy was available. Replace with a current traded yield or synthetic rating spread.",
+        );
   market.preTaxCostOfDebt = preTaxCostOfDebt;
   const preferredCost = preferredWeightValue === 0
     ? derived(0, "Preferred cost", "%", "Not applicable because the preferred weight is zero.", preferredStock)
     : assumed(0.08, "Preferred cost", "%", "Review default: 8.0% required return for material preferred equity; replace with the security's current yield.");
 
-  const latestEbitda = latest?.ebit.value !== null && latest?.ebit.value !== undefined
-    && latest?.depreciationAmortization.value !== null && latest?.depreciationAmortization.value !== undefined
-    ? latest.ebit.value + latest.depreciationAmortization.value
-    : null;
-  const subjectEnterpriseValue = marketCapitalization !== null
-    ? marketCapitalization + debtCapital + (minorityInterest.value ?? 0) + (preferredStock.value ?? 0)
-      - (cash.value ?? 0) - (shortTermInvestments.value ?? 0) - (equityMethodInvestments.value ?? 0)
-    : null;
-  const subjectExitMultiple = subjectEnterpriseValue !== null && latestEbitda !== null && latestEbitda > 0
-    ? subjectEnterpriseValue / latestEbitda
-    : null;
   const exitMultiple = market.peerExitMultiple.value !== null
     ? derived(market.peerExitMultiple.value, "Exit EV/EBITDA", "x", "Peer-median market cross-check; Gordon growth remains the primary intrinsic method.", market.peerExitMultiple)
-    : subjectExitMultiple !== null && subjectExitMultiple >= 2 && subjectExitMultiple <= 50
-      ? derived(subjectExitMultiple, "Exit EV/EBITDA", "x", "Current subject-company EV/EBITDA is used only as a review cross-check because a defensible peer median was unavailable.", market.currentPrice)
-      : assumed(10, "Exit EV/EBITDA", "x", "Review default: 10.0x cross-check because neither a peer median nor a usable subject-company multiple was available. Gordon growth remains primary.");
+    : derived(
+        null,
+        "Exit EV/EBITDA",
+        "x",
+        "No defensible peer median was available. The subject company's own trading multiple is deliberately not used because that would make the cross-check circular; enter a reviewed forward peer multiple if desired.",
+      );
 
   const assumptions: ProjectionAssumptions = {
     projectionYears,
@@ -526,6 +549,13 @@ export async function buildModelPayload(ticker: string): Promise<ModelPayload> {
       severity: "warning",
       affectedOutputs: ["Latest interim display"],
     });
+  } else {
+    gaps.push({
+      field: "Interim / stub integration",
+      reason: `${sec.historicals.latestInterim.period.label} is displayed for review but is not automatically spliced into an LTM base. The first forecast period is date-weighted from the latest annual case; reconcile the reported interim and remaining stub before circulation.`,
+      severity: "review",
+      affectedOutputs: ["First forecast period", "DCF"],
+    });
   }
   if (market.currentPrice.value === null) {
     gaps.push({
@@ -563,7 +593,7 @@ export async function buildModelPayload(ticker: string): Promise<ModelPayload> {
       affectedOutputs: ["Gordon terminal value", "Per-share value"],
     });
   }
-  if (assumptions.exitMultiple.provenance.origin !== "assumed") {
+  if (assumptions.exitMultiple.value !== null && assumptions.exitMultiple.provenance.origin !== "assumed") {
     gaps.push({
       field: "Exit multiple",
       reason: `${assumptions.exitMultiple.provenance.notes ?? "Market cross-check."} Review the selected peer set and forward-period consistency.`,
@@ -571,15 +601,26 @@ export async function buildModelPayload(ticker: string): Promise<ModelPayload> {
       affectedOutputs: ["Exit-multiple cross-check"],
     });
   }
+  if (assumptions.exitMultiple.value === null) {
+    gaps.push({
+      field: "Exit-multiple cross-check",
+      reason: assumptions.exitMultiple.provenance.notes ?? "Enter a reviewed peer-median forward EV / EBITDA multiple if an exit-method cross-check is required.",
+      severity: "review",
+      affectedOutputs: ["Exit-multiple cross-check"],
+    });
+  }
   for (const [field, value] of [
     ["Cash", bridge.cash],
+    ["Operating cash requirement", bridge.operatingCashRequirement],
     ["Short-term investments", bridge.shortTermInvestments],
     ["Total debt", bridge.debt],
     ["Finance lease liabilities", bridge.financeLeaseLiabilities],
     ["Operating lease treatment", bridge.operatingLeaseLiabilities],
+    ["Other debt-like liabilities", bridge.otherDebtLikeLiabilities],
     ["Minority interest", bridge.minorityInterest],
     ["Preferred stock", bridge.preferredStock],
-    ["Equity-method investments", bridge.equityMethodInvestments],
+    ["Non-operating investments", bridge.equityMethodInvestments],
+    ["Other non-operating assets", bridge.otherNonOperatingAssets],
     ["Present value of usable NOLs", bridge.presentValueOfNols],
     ["Current shares outstanding", bridge.basicShares],
     ["Options", bridge.options],
