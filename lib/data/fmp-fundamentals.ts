@@ -122,8 +122,8 @@ function buildPeriod(
     cash: tagged(balance, ["cashAndCashEquivalents"], "Cash and equivalents"),
     shortTermInvestments: tagged(balance, ["shortTermInvestments"], "Short-term investments"),
     totalDebt: sum("Total debt", [currentDebt, longTermDebt]),
-    financeLeaseLiabilities: tagged(balance, ["capitalLeaseObligations", "financeLeaseLiabilities"], "Finance lease liabilities"),
-    operatingLeaseLiabilities: tagged(balance, ["operatingLeaseLiabilities"], "Operating lease liabilities"),
+    financeLeaseLiabilities: tagged(balance, ["financeLeaseLiabilities"], "Finance lease liabilities"),
+    operatingLeaseLiabilities: tagged(balance, ["operatingLeaseLiabilities", "capitalLeaseObligations"], "Operating and unclassified lease liabilities"),
     minorityInterest: tagged(balance, ["minorityInterest"], "Minority interest"),
     preferredStock: tagged(balance, ["preferredStock"], "Preferred stock"),
     equityMethodInvestments: tagged(balance, ["investmentsInFinancialAssets", "longTermInvestments"], "Equity-method investments"),
@@ -135,14 +135,15 @@ function buildPeriod(
 }
 
 export async function loadFmpFundamentals(ticker: string): Promise<SecBundle> {
+  const optional = <T>(request: Promise<T>, fallback: T) => request.catch(() => fallback);
   const [profilePayload, annualIncomePayload, annualBalancePayload, annualCashPayload, quarterIncomePayload, quarterBalancePayload, quarterCashPayload] = await Promise.all([
     fetchFmp<unknown>("/profile", { symbol: ticker }),
     fetchFmp<unknown>("/income-statement", { symbol: ticker, period: "annual", limit: "5" }),
-    fetchFmp<unknown>("/balance-sheet-statement", { symbol: ticker, period: "annual", limit: "5" }),
-    fetchFmp<unknown>("/cash-flow-statement", { symbol: ticker, period: "annual", limit: "5" }),
-    fetchFmp<unknown>("/income-statement", { symbol: ticker, period: "quarter", limit: "4" }),
-    fetchFmp<unknown>("/balance-sheet-statement", { symbol: ticker, period: "quarter", limit: "4" }),
-    fetchFmp<unknown>("/cash-flow-statement", { symbol: ticker, period: "quarter", limit: "4" }),
+    optional(fetchFmp<unknown>("/balance-sheet-statement", { symbol: ticker, period: "annual", limit: "5" }), []),
+    optional(fetchFmp<unknown>("/cash-flow-statement", { symbol: ticker, period: "annual", limit: "5" }), []),
+    optional(fetchFmp<unknown>("/income-statement", { symbol: ticker, period: "quarter", limit: "4" }), []),
+    optional(fetchFmp<unknown>("/balance-sheet-statement", { symbol: ticker, period: "quarter", limit: "4" }), []),
+    optional(fetchFmp<unknown>("/cash-flow-statement", { symbol: ticker, period: "quarter", limit: "4" }), []),
   ]);
   const profile = rows(profilePayload)[0];
   const annualIncome = rows(annualIncomePayload).sort((a, b) => String(a.date).localeCompare(String(b.date)));

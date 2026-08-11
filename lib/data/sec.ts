@@ -172,6 +172,7 @@ function chooseFact(
       if (fact.form === period.form) score += 4;
       if (fact.fy === period.fiscalYear) score += 2;
       if (fact.filed === period.filingDate) score += 1;
+      if (duration && fact.start === period.startDate) score += 20;
       candidates.push({ tag, concept, unit, fact, score });
     }
   }
@@ -255,16 +256,19 @@ function annualPeriods(facts: CompanyFactsResponse): FiscalPeriod[] {
   return [...byEnd.values()]
     .sort((a, b) => a.end.localeCompare(b.end))
     .slice(-6)
-    .map((fact) => ({
-      fiscalYear: fact.fy ?? new Date(fact.end).getUTCFullYear(),
+    .map((fact) => {
+      const fiscalYear = new Date(`${fact.end}T00:00:00Z`).getUTCFullYear();
+      return {
+      fiscalYear,
       startDate: fact.start,
       endDate: fact.end,
       filingDate: fact.filed,
       form: fact.form,
       accessionNumber: fact.accn,
-      label: `FY${fact.fy ?? new Date(fact.end).getUTCFullYear()}`,
+      label: `FY${fiscalYear}`,
       interim: false,
-    }));
+      };
+    });
 }
 
 function latestInterimPeriod(facts: CompanyFactsResponse): FiscalPeriod | null {
@@ -283,7 +287,7 @@ function latestInterimPeriod(facts: CompanyFactsResponse): FiscalPeriod | null {
     ? Math.round((new Date(fact.end).getTime() - new Date(fact.start).getTime()) / 86_400_000)
     : null;
   return {
-    fiscalYear: fact.fy ?? new Date(fact.end).getUTCFullYear(),
+    fiscalYear: new Date(`${fact.end}T00:00:00Z`).getUTCFullYear(),
     startDate: fact.start,
     endDate: fact.end,
     filingDate: fact.filed,

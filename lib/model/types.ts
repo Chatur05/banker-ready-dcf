@@ -1,4 +1,4 @@
-export type ValueOrigin = "sourced" | "derived" | "assumed" | "missing";
+export type ValueOrigin = "sourced" | "derived" | "assumed" | "user" | "missing";
 
 export type Provenance = {
   origin: ValueOrigin;
@@ -20,7 +20,7 @@ export type TaggedValue = {
 export type DataGap = {
   field: string;
   reason: string;
-  severity: "blocking" | "warning";
+  severity: "blocking" | "review" | "warning";
   affectedOutputs: string[];
 };
 
@@ -94,8 +94,17 @@ export type PeerBeta = {
   sourceUrl: string;
 };
 
+export type AnalystEstimate = {
+  fiscalDate: string;
+  revenue: number;
+  ebit: number | null;
+  revenueAnalystCount: number | null;
+  sourceUrl: string;
+};
+
 export type MarketInputs = {
   currentPrice: TaggedValue;
+  currentShares: TaggedValue;
   fiftyTwoWeekLow: TaggedValue;
   fiftyTwoWeekHigh: TaggedValue;
   riskFreeRate: TaggedValue;
@@ -107,6 +116,7 @@ export type MarketInputs = {
   targetDebtWeight: TaggedValue;
   targetEquityWeight: TaggedValue;
   peerBetas: PeerBeta[];
+  analystEstimates: AnalystEstimate[];
 };
 
 export type ProjectionAssumptions = {
@@ -139,13 +149,16 @@ export type ProjectionAssumptions = {
 
 export type EquityBridge = {
   cash: TaggedValue;
+  operatingCashRequirement: TaggedValue;
   shortTermInvestments: TaggedValue;
   debt: TaggedValue;
   financeLeaseLiabilities: TaggedValue;
   operatingLeaseLiabilities: TaggedValue;
+  otherDebtLikeLiabilities: TaggedValue;
   minorityInterest: TaggedValue;
   preferredStock: TaggedValue;
   equityMethodInvestments: TaggedValue;
+  otherNonOperatingAssets: TaggedValue;
   presentValueOfNols: TaggedValue;
   basicShares: TaggedValue;
   options: TaggedValue;
@@ -178,6 +191,7 @@ export type ProjectionYear = {
   netWorkingCapital: number;
   changeInNetWorkingCapital: number;
   unleveredFreeCashFlow: number;
+  fullYearUnleveredFreeCashFlow: number;
   stubFraction: number;
   discountPeriod: number;
   discountFactor: number;
@@ -202,6 +216,11 @@ export type DcfResult = {
   enterpriseValueGordon: number | null;
   enterpriseValueExit: number | null;
   terminalValuePctEnterpriseValue: number | null;
+  terminalNopat: number | null;
+  terminalReinvestmentRate: number | null;
+  terminalFreeCashFlow: number | null;
+  terminalDiscountPeriod: number | null;
+  terminalDiscountFactor: number | null;
   commonEquityValueGordon: number | null;
   commonEquityValueExit: number | null;
   fullyDilutedShares: number | null;
