@@ -3,9 +3,28 @@ import type { AnalystEstimate, MarketInputs, TaggedValue } from "../model/types"
 
 const FMP_BASE = "https://financialmodelingprep.com/stable";
 const CACHE_TTL = 30 * 60 * 1000;
+const REQUEST_LIMIT_COOLDOWN = 60 * 1000;
 const memoryCache = new Map<string, { expires: number; value: unknown }>();
 const inFlight = new Map<string, Promise<unknown>>();
-let planLimitCircuitUntil = 0;
+const requestLimitCircuit = new Map<string, number>();
+
+function isUsageLimitResponse(status: number, responseText: string): boolean {
+  if (status === 429) return true;
+  return [
+    /\blimit reach(?:ed)?\b/i,
+    /\b(?:daily|monthly)\s+(?:api\s+)?(?:call|request|usage|data)\s+limit\b/i,
+    /\b(?:api\s+)?(?:call|request|usage|bandwidth)\s+limit\s+(?:has\s+been\s+)?(?:reached|exceeded)\b/i,
+    /\b(?:usage|bandwidth)\s+(?:has\s+been\s+)?exceeded\b/i,
+    /\btoo many requests\b/i,
+    /\brate limit(?: has been)? exceeded\b/i,
+  ].some((pattern) => pattern.test(responseText));
+}
+
+function isEntitlementResponse(status: number, responseText: string): boolean {
+  if (status !== 402 && status !== 403) return false;
+  return /(?:not available|not included|premium query parameter).*(?:plan|subscription)|(?:plan|subscription).*(?:not available|not included)/i
+    .test(responseText);
+}
 
 function missing(label: string, units: string, notes: string): TaggedValue {
   return { value: null, provenance: { origin: "missing", label, units, notes } };
@@ -38,9 +57,12 @@ function sourced(
 async function requestFmp<T>(path: string, params: Record<string, string>, cacheKey: string): Promise<T> {
   const apiKey = process.env.FMP_API_KEY;
   if (!apiKey) throw new Error("FMP_API_KEY is not configured.");
-  if (planLimitCircuitUntil > Date.now()) {
-    throw new Error("FMP plan limit was recently reached; requests are temporarily paused to avoid consuming additional quota.");
+  const circuitUntil = requestLimitCircuit.get(cacheKey) ?? 0;
+  if (circuitUntil > Date.now()) {
+    const retrySeconds = Math.max(1, Math.ceil((circuitUntil - Date.now()) / 1_000));
+    throw new Error(`FMP rate-limited this exact request; retry in ${retrySeconds} seconds.`);
   }
+  requestLimitCircuit.delete(cacheKey);
   const query = new URLSearchParams(params);
   query.set("apikey", apiKey);
   let lastError: Error | null = null;
@@ -52,15 +74,24 @@ async function requestFmp<T>(path: string, params: Record<string, string>, cache
       });
       if (response.ok) {
         const value = await response.json() as T;
+        requestLimitCircuit.delete(cacheKey);
         memoryCache.set(cacheKey, { expires: Date.now() + CACHE_TTL, value });
         return value;
       }
       const responseText = await response.text();
-      const planLimit = /plan|limit.*reached|upgrade|subscription/i.test(responseText);
-      if (planLimit) planLimitCircuitUntil = Date.now() + 15 * 60 * 1000;
+      const usageLimited = isUsageLimitResponse(response.status, responseText);
+      const entitlementRestricted = isEntitlementResponse(response.status, responseText);
       const safeDetail = responseText.replaceAll(apiKey, "[redacted]").replace(/\s+/g, " ").slice(0, 220);
-      lastError = new Error(`FMP request failed (${response.status}) for ${path}${safeDetail ? `: ${safeDetail}` : ""}`);
-      if (planLimit) break;
+      const symbol = params.symbol?.toUpperCase();
+      lastError = entitlementRestricted
+        ? new Error(
+            `FMP subscription access denied (${response.status}) for ${path}${symbol ? ` and ${symbol}` : ""}. `
+            + "The configured subscription does not include this endpoint/ticker combination; this is not an exhausted daily request allowance.",
+          )
+        : new Error(`FMP request failed (${response.status}) for ${path}${safeDetail ? `: ${safeDetail}` : ""}`);
+      if (usageLimited && attempt === 2) {
+        requestLimitCircuit.set(cacheKey, Date.now() + REQUEST_LIMIT_COOLDOWN);
+      }
       if (response.status !== 429 && response.status < 500) break;
       if (attempt === 2) break;
       const retryAfter = Number(response.headers.get("Retry-After"));
