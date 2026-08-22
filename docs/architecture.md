@@ -45,7 +45,7 @@ Coverage: SEC retains filing-grade provenance when accessible, with FMP standard
 
 Depth and fiscal handling: SEC provides the historical depth and fiscal-period fidelity. FMP provides price history, quote, peers, Treasury, and ERP endpoints through its supported Stable API.
 
-Rate limits and cost: Requests are cached, coalesced, and bounded. Optional FMP endpoints degrade to review defaults independently. Transient rate-limit or server failures receive bounded retry, while provider plan-limit responses open a temporary circuit breaker rather than consuming additional quota.
+Rate limits and cost: Requests are cached, coalesced, and bounded. Optional FMP endpoints degrade to review defaults independently. Transient rate-limit or server failures receive bounded retry. A repeated HTTP 429 opens a one-minute circuit only for the exact failed request; an endpoint-level plan entitlement restriction never blocks the filing endpoints or a different ticker.
 
 Reviewer credentials: Reviewers of the deployed application need no credentials because the key remains server-side. If a market endpoint is unavailable, the app uses a visible house default and omits only source-dependent comparisons such as market upside/downside.
 

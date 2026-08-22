@@ -89,6 +89,7 @@ The engine result ties to the independently written arithmetic within less than 
 
 - Five-year context selection and latest-quarter normalization through the primary SEC adapter in the deployed runtime; the SEC host currently returns HTTP 403 there.
 - A repeat live Microsoft automatic-case smoke test after the latest low-call market-input optimization; the configured FMP key reached its plan limit during repeated validation requests.
+- FMP failure-isolation regression coverage: a 402 endpoint/ticker-entitlement message cannot poison later filing requests, while a genuine repeated 429 cools down only the exact request for one minute and still permits a different ticker to probe the provider.
 - Company-specific award-level dilution and lease-note parsing through the primary SEC adapter in the deployed runtime.
 - The automatic model is a review-required top-down FCFF screen, not a fully integrated three-statement transaction model with issuer-specific PP&E, tax, debt, lease and share-count schedules.
 - The two development-only `image-size` denial-of-service advisories inherited through vinext remain upstream with no patched package version reported by npm on the validation date; production dependencies audit with zero known vulnerabilities and the application does not accept user-supplied images.

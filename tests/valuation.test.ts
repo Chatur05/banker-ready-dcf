@@ -3,6 +3,7 @@ import test from "node:test";
 import ExcelJS from "exceljs";
 import { PDFDocument } from "pdf-lib";
 import { loadFmpFundamentals } from "../lib/data/fmp-fundamentals";
+import { fetchFmp } from "../lib/data/fmp";
 import { buildModelPayload } from "../lib/data/model";
 import { buildExcelWorkbook } from "../lib/export/excel-xml";
 import { buildPdf } from "../lib/export/pdf";
@@ -354,6 +355,85 @@ test("FMP fallback stays within the five-period statement entitlement", async ()
       url.searchParams.get("period") === "annual");
     assert.equal(annualStatementRequests.length, 3);
     assert.equal(annualStatementRequests.every((url) => url.searchParams.get("limit") === "5"), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.FMP_API_KEY;
+    else process.env.FMP_API_KEY = originalKey;
+  }
+});
+
+test("an endpoint entitlement restriction does not poison later FMP requests", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.FMP_API_KEY;
+  const requestedPaths: string[] = [];
+  process.env.FMP_API_KEY = "entitlement-isolation-test-key";
+  globalThis.fetch = (async (input) => {
+    const url = new URL(String(input));
+    requestedPaths.push(url.pathname);
+    if (url.pathname.endsWith("/restricted-entitlement-test")) {
+      return new Response(JSON.stringify({
+        "Error Message": "Premium Query Parameter: This value set for 'symbol' is not available under your current subscription.",
+      }), { status: 402, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify([{ symbol: "AFTER", companyName: "Available Endpoint Inc." }]), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  try {
+    await assert.rejects(
+      fetchFmp("/restricted-entitlement-test", { symbol: "ENTITLEMENT" }),
+      /endpoint\/ticker combination.*not an exhausted daily request allowance/i,
+    );
+    const available = await fetchFmp<Array<{ symbol: string }>>("/profile", { symbol: "AFTER-ENTITLEMENT" });
+    assert.equal(available[0]?.symbol, "AFTER");
+    assert.deepEqual(requestedPaths, [
+      "/stable/restricted-entitlement-test",
+      "/stable/profile",
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.FMP_API_KEY;
+    else process.env.FMP_API_KEY = originalKey;
+  }
+});
+
+test("a genuine rate-limit circuit is short-lived and isolated to the exact request", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.FMP_API_KEY;
+  const requestCounts = new Map<string, number>();
+  process.env.FMP_API_KEY = "rate-limit-isolation-test-key";
+  globalThis.fetch = (async (input) => {
+    const url = new URL(String(input));
+    const symbol = url.searchParams.get("symbol") ?? "";
+    requestCounts.set(symbol, (requestCounts.get(symbol) ?? 0) + 1);
+    if (symbol === "RATE-LIMITED") {
+      return new Response(JSON.stringify({
+        "Error Message": "Too many requests (rate limit exceeded)",
+      }), { status: 429, headers: { "Content-Type": "application/json", "Retry-After": "0" } });
+    }
+    return new Response(JSON.stringify([{ symbol, companyName: "Available Endpoint Inc." }]), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  try {
+    await assert.rejects(
+      fetchFmp("/profile", { symbol: "RATE-LIMITED" }),
+      /rate limit exceeded/i,
+    );
+    assert.equal(requestCounts.get("RATE-LIMITED"), 3);
+    await assert.rejects(
+      fetchFmp("/profile", { symbol: "RATE-LIMITED" }),
+      /rate-limited this exact request/i,
+    );
+    assert.equal(requestCounts.get("RATE-LIMITED"), 3, "The identical request should be cooled down without another provider call.");
+
+    const available = await fetchFmp<Array<{ symbol: string }>>("/profile", { symbol: "AFTER-RATE-LIMIT" });
+    assert.equal(available[0]?.symbol, "AFTER-RATE-LIMIT");
+    assert.equal(requestCounts.get("AFTER-RATE-LIMIT"), 1, "A different ticker must still be allowed to probe FMP.");
   } finally {
     globalThis.fetch = originalFetch;
     if (originalKey === undefined) delete process.env.FMP_API_KEY;
