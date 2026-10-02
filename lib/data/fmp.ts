@@ -1,5 +1,7 @@
 import { median } from "../model/math";
 import type { AnalystEstimate, MarketInputs, TaggedValue } from "../model/types";
+import { numeric } from "./numeric";
+import { createHash } from "node:crypto";
 
 const FMP_BASE = "https://financialmodelingprep.com/stable";
 const CACHE_TTL = 30 * 60 * 1000;
@@ -74,6 +76,14 @@ async function requestFmp<T>(path: string, params: Record<string, string>, cache
       });
       if (response.ok) {
         const value = await response.json() as T;
+        const providerError = value && typeof value === "object" && !Array.isArray(value)
+          ? (value as Record<string, unknown>)["Error Message"] ?? (value as Record<string, unknown>).error : undefined;
+        if (providerError) {
+          const detail = String(providerError).replaceAll(apiKey, "[redacted]").slice(0, 220);
+          if (isUsageLimitResponse(200, detail)) requestLimitCircuit.set(cacheKey, Date.now() + REQUEST_LIMIT_COOLDOWN);
+          lastError = new Error(`FMP returned an error payload for ${path}: ${detail}`);
+          break;
+        }
         requestLimitCircuit.delete(cacheKey);
         memoryCache.set(cacheKey, { expires: Date.now() + CACHE_TTL, value });
         return value;
@@ -89,9 +99,13 @@ async function requestFmp<T>(path: string, params: Record<string, string>, cache
             + "The configured subscription does not include this endpoint/ticker combination; this is not an exhausted daily request allowance.",
           )
         : new Error(`FMP request failed (${response.status}) for ${path}${safeDetail ? `: ${safeDetail}` : ""}`);
-      if (usageLimited && attempt === 2) {
-        requestLimitCircuit.set(cacheKey, Date.now() + REQUEST_LIMIT_COOLDOWN);
+      const retryAfterHeader = response.headers.get("Retry-After");
+      const retrySeconds = retryAfterHeader && Number.isFinite(Number(retryAfterHeader)) ? Number(retryAfterHeader)
+        : retryAfterHeader ? Math.max(0, (Date.parse(retryAfterHeader) - Date.now()) / 1000) : 0;
+      if (usageLimited && (attempt === 2 || response.status !== 429 || retrySeconds > 5)) {
+        requestLimitCircuit.set(cacheKey, Date.now() + Math.max(REQUEST_LIMIT_COOLDOWN, Number.isFinite(retrySeconds) ? retrySeconds * 1000 : 0));
       }
+      if (retrySeconds > 5) break; // Respect provider backoff without holding a valuation request open.
       if (response.status !== 429 && response.status < 500) break;
       if (attempt === 2) break;
       const retryAfter = Number(response.headers.get("Retry-After"));
@@ -108,8 +122,11 @@ async function requestFmp<T>(path: string, params: Record<string, string>, cache
 }
 
 export async function fetchFmp<T>(path: string, params: Record<string, string> = {}): Promise<T> {
+  if (!process.env.FMP_API_KEY) throw new Error("FMP_API_KEY is not configured.");
   const query = new URLSearchParams(params);
-  const cacheKey = `${path}?${query.toString()}`;
+  query.sort();
+  const credentialScope = createHash("sha256").update(process.env.FMP_API_KEY).digest("hex");
+  const cacheKey = `${credentialScope}:${path}?${query.toString()}`;
   const cached = memoryCache.get(cacheKey);
   if (cached && cached.expires > Date.now()) return cached.value as T;
   const pending = inFlight.get(cacheKey);
@@ -147,15 +164,6 @@ function arrayPayload<T>(payload: unknown): T[] {
     }
   }
   return [];
-}
-
-function numeric(record: Record<string, unknown> | undefined, keys: string[]): number | null {
-  if (!record) return null;
-  for (const key of keys) {
-    const candidate = Number(record[key]);
-    if (Number.isFinite(candidate)) return candidate;
-  }
-  return null;
 }
 
 async function peerExitMultiple(symbol: string): Promise<number | null> {

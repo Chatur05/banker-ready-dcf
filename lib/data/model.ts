@@ -1,4 +1,4 @@
-import { median } from "../model/math";
+import { addFiscalYears, median } from "../model/math";
 import type {
   AnalystEstimate,
   DataGap,
@@ -84,7 +84,7 @@ function interpolate(start: number, end: number, progress: number): number {
   return start + (end - start) * progress;
 }
 
-function operatingForecast(
+export function operatingForecast(
   latest: PeriodFinancials | undefined,
   estimates: AnalystEstimate[],
   projectionYears: number,
@@ -94,10 +94,8 @@ function operatingForecast(
 ): { revenueGrowth: TaggedValue[]; ebitMargin: TaggedValue[] } {
   const latestRevenue = latest?.revenue.value;
   const latestEnd = latest?.period.endDate ?? "";
-  const consensus = estimates
-    .filter((estimate) => estimate.fiscalDate > latestEnd
-      && (estimate.revenueAnalystCount === null || estimate.revenueAnalystCount >= 3))
-    .slice(0, Math.min(3, projectionYears));
+  const consensus = estimates.filter((estimate) => estimate.revenue > 0 && estimate.fiscalDate > latestEnd
+    && estimate.revenueAnalystCount !== null && estimate.revenueAnalystCount >= 3);
   const revenueGrowth: TaggedValue[] = [];
   const ebitMargin: TaggedValue[] = [];
   let priorRevenue = latestRevenue;
@@ -105,14 +103,15 @@ function operatingForecast(
   let lastMargin = clamp(historicalMargin, -0.25, 0.60);
 
   for (let index = 0; index < projectionYears; index += 1) {
-    const estimate = consensus[index];
+    const expectedEnd = addFiscalYears(latestEnd, index + 1);
+    const estimate = index < 3 ? consensus.find((item) => Math.abs(Date.parse(item.fiscalDate) - Date.parse(expectedEnd)) <= 14 * 86_400_000) : undefined;
     const consensusGrowth = estimate && priorRevenue && priorRevenue > 0
       ? estimate.revenue / priorRevenue - 1
       : null;
     const consensusMargin = estimate?.ebit !== null && estimate?.ebit !== undefined
       ? estimate.ebit / estimate.revenue
       : null;
-    if (estimate && consensusGrowth !== null && consensusGrowth >= -0.30 && consensusGrowth <= 0.40) {
+    if (estimate && consensusGrowth !== null && consensusGrowth >= -0.95 && consensusGrowth <= 1) {
       lastGrowth = consensusGrowth;
       revenueGrowth.push({
         value: consensusGrowth,
@@ -125,10 +124,9 @@ function operatingForecast(
           notes: `Derived from FMP analyst-consensus revenue for ${estimate.fiscalDate}; ${estimate.revenueAnalystCount ?? "unreported"} contributing analysts.`,
         },
       });
-      priorRevenue = estimate.revenue;
     } else {
-      const remaining = Math.max(1, projectionYears - consensus.length);
-      const progress = Math.min(1, (index - consensus.length + 1) / remaining);
+      const remaining = Math.max(1, projectionYears - index);
+      const progress = 1 / remaining;
       lastGrowth = interpolate(lastGrowth, terminalGrowth + 0.005, progress);
       revenueGrowth.push(derived(
         lastGrowth,
@@ -140,6 +138,7 @@ function operatingForecast(
         latest?.revenue,
       ));
     }
+    if (priorRevenue !== null && priorRevenue !== undefined) priorRevenue *= 1 + lastGrowth;
 
     if (estimate && consensusMargin !== null && consensusMargin >= -0.30 && consensusMargin <= 0.70) {
       lastMargin = consensusMargin;
@@ -155,9 +154,9 @@ function operatingForecast(
         },
       });
     } else {
-      const remaining = Math.max(1, projectionYears - consensus.length);
-      const progress = Math.min(1, (index - consensus.length + 1) / remaining);
-      lastMargin = interpolate(lastMargin, historicalMargin, progress);
+      const remaining = Math.max(1, projectionYears - index);
+      const progress = 1 / remaining;
+      lastMargin = interpolate(lastMargin, clamp(historicalMargin, -0.95, 0.60), progress);
       ebitMargin.push(derived(
         lastMargin,
         "EBIT margin",
@@ -244,13 +243,26 @@ export async function buildModelPayload(ticker: string): Promise<ModelPayload> {
       sec = await loadFmpFundamentals(ticker);
     } catch (fmpError) {
       const fallbackMessage = fmpError instanceof Error ? fmpError.message : "FMP filing retrieval failed.";
+      if (fallbackMessage.startsWith("Unsupported")) throw new Error(fallbackMessage);
       throw new Error(
-        `Unable to retrieve verified filings. Primary SEC source: ${filingFallbackReason} FMP filing fallback: ${fallbackMessage}`,
+        `Unable to retrieve required financial statements. Primary SEC source: ${filingFallbackReason} FMP fallback: ${fallbackMessage}`,
       );
     }
   }
   const annual = sec.historicals.annual;
   const latest = annual.at(-1);
+  if (["F", "GM"].includes(sec.identity.ticker.toUpperCase())) {
+    sec.identity.valuationMethodEligible = false;
+    sec.identity.ineligibleReason = "A material captive-finance subsidiary requires a separate industrial/financial sum-of-the-parts valuation.";
+  }
+  const balancePeriod = sec.historicals.latestInterim && sec.historicals.latestInterim.period.endDate > (latest?.period.endDate ?? "")
+    ? sec.historicals.latestInterim : latest;
+  const balanceValue = (key: keyof Omit<PeriodFinancials, "period">): TaggedValue | undefined => {
+    const current = balancePeriod?.[key];
+    if (current?.value !== null && current?.value !== undefined) return current;
+    const prior = latest?.[key];
+    return prior ? { ...prior, provenance: { ...prior.provenance, notes: `${prior.provenance.notes ?? ""} Latest interim field unavailable; annual balance retained and requires review.` } } : undefined;
+  };
   const revenueGrowth = annual.slice(1).map((period, index) =>
     safeRatio(period.revenue.value, annual[index].revenue.value) === null
       ? null
@@ -274,16 +286,16 @@ export async function buildModelPayload(ticker: string): Promise<ModelPayload> {
     market = marketInputsUnavailable(`Market inputs could not be verified: ${reason}`);
   }
 
-  const cash = reviewDefault(latest?.cash, 0, "Cash and equivalents", "$mm", "No usable standardized cash balance was returned; zero is conservative in the equity bridge.");
+  const cash = balanceValue("cash") ?? derived(null, "Cash and equivalents", "$mm", "Reported cash is required.");
   const operatingCashRequirement = assumed(
     0,
     "Operating cash requirement",
     "$mm",
     "Review default: zero. Enter cash required to run the business; only cash above this amount is treated as excess in the equity bridge.",
   );
-  const shortTermInvestments = reviewDefault(latest?.shortTermInvestments, 0, "Short-term investments", "$mm", "No separately identified short-term investment balance was returned.");
-  const debt = reviewDefault(latest?.totalDebt, 0, "Total debt", "$mm", "No funded-debt balance was returned from the standardized statements.");
-  const financeLeaseLiabilities = reviewDefault(latest?.financeLeaseLiabilities, 0, "Finance lease liabilities", "$mm", "No separately identified finance-lease liability was returned.");
+  const shortTermInvestments = reviewDefault(balanceValue("shortTermInvestments"), 0, "Short-term investments", "$mm", "No separately identified short-term investment balance was returned.");
+  const debt = balanceValue("totalDebt") ?? derived(null, "Total debt", "$mm", "Reported funded debt is required.");
+  const financeLeaseLiabilities = reviewDefault(balanceValue("financeLeaseLiabilities"), 0, "Finance lease liabilities", "$mm", "No separately identified finance-lease liability was returned. Check lease footnotes; combined lease obligations cannot safely be split automatically.");
   const operatingLeaseLiabilities = assumed(
     0,
     "Operating lease debt adjustment",
@@ -296,9 +308,9 @@ export async function buildModelPayload(ticker: string): Promise<ModelPayload> {
     "$mm",
     "Review default: zero. Add unfunded pensions, restructuring reserves, environmental obligations, deferred consideration, or other debt-like claims when material.",
   );
-  const minorityInterest = reviewDefault(latest?.minorityInterest, 0, "Minority interest", "$mm", "No noncontrolling-interest balance was returned; confirm against the latest balance sheet.");
-  const preferredStock = reviewDefault(latest?.preferredStock, 0, "Preferred stock", "$mm", "No preferred-equity balance was returned; confirm against the latest balance sheet.");
-  const equityMethodInvestments = reviewDefault(latest?.equityMethodInvestments, 0, "Non-operating investments", "$mm", "No separately valued non-operating investment balance was returned; confirm classification and value against the filing.");
+  const minorityInterest = reviewDefault(balanceValue("minorityInterest"), 0, "Minority interest", "$mm", "No noncontrolling-interest balance was returned; confirm against the latest balance sheet.");
+  const preferredStock = reviewDefault(balanceValue("preferredStock"), 0, "Preferred stock", "$mm", "No preferred-equity balance was returned; confirm against the latest balance sheet.");
+  const equityMethodInvestments = reviewDefault(balanceValue("equityMethodInvestments"), 0, "Non-operating investments", "$mm", "No separately valued non-operating investment balance was returned; confirm classification and value against the filing.");
   const otherNonOperatingAssets = assumed(
     0,
     "Other non-operating assets",
@@ -315,18 +327,18 @@ export async function buildModelPayload(ticker: string): Promise<ModelPayload> {
   );
   const shareSource = market.currentShares.value !== null
     ? market.currentShares
-    : latest?.sharesOutstanding.value !== null
-      ? latest!.sharesOutstanding
-      : latest?.basicShares.value !== null
-        ? latest!.basicShares
-        : latest?.dilutedShares;
+    : balanceValue("sharesOutstanding")?.value != null
+      ? balanceValue("sharesOutstanding")
+      : balanceValue("basicShares")?.value != null
+        ? balanceValue("basicShares")
+        : balanceValue("dilutedShares");
   const basicShares = reviewDefault(shareSource, 0, "Current shares outstanding", "mm shares", "No valid current or weighted-average share count was returned; a positive share count is required.");
   const detailedAwardsAvailable = sec.latestOptions.value !== null
     && sec.latestOptionStrike.value !== null
     && sec.latestRsus.value !== null
     && market.currentPrice.value !== null;
-  const basicWeightedAverage = latest?.basicShares.value;
-  const dilutedWeightedAverage = latest?.dilutedShares.value;
+  const basicWeightedAverage = balanceValue("basicShares")?.value;
+  const dilutedWeightedAverage = balanceValue("dilutedShares")?.value;
   const dilutionRatio = basicWeightedAverage && basicWeightedAverage > 0 && dilutedWeightedAverage !== null && dilutedWeightedAverage !== undefined
     ? Math.max(0, dilutedWeightedAverage / basicWeightedAverage - 1)
     : 0;
@@ -365,6 +377,9 @@ export async function buildModelPayload(ticker: string): Promise<ModelPayload> {
   };
 
   const projectionYears = 5;
+  const valuationDate = new Date().toISOString().slice(0, 10);
+  let elapsedYears = 0;
+  while (latest && elapsedYears < 3 && addFiscalYears(latest.period.endDate, elapsedYears + 1) <= valuationDate) elapsedYears++;
   const terminalGrowth = assumed(
     0.025,
     "Terminal growth",
@@ -372,11 +387,11 @@ export async function buildModelPayload(ticker: string): Promise<ModelPayload> {
     "Review default: 2.5% for a mature U.S.-dollar company, checked against the available nominal-GDP benchmark and constrained below WACC.",
   );
   const historicalGrowth = median(revenueGrowth) ?? 0.03;
-  const historicalMargin = median(ebitMargins.slice(-5)) ?? 0.10;
+  const historicalMargin = median(ebitMargins.slice(-3)) ?? 0.10;
   const forecast = operatingForecast(
     latest,
     market.analystEstimates,
-    projectionYears,
+    projectionYears + elapsedYears,
     historicalGrowth,
     historicalMargin,
     terminalGrowth.value!,
@@ -396,7 +411,7 @@ export async function buildModelPayload(ticker: string): Promise<ModelPayload> {
     "Zero is used because historical standardized SBC was incomplete; review for equity-compensation-heavy issuers.",
   );
   const capexSeed = reviewDefault(
-    derived(median(capexPercent.slice(-5)), "Capex / revenue", "%", "Historical median of the latest five annual observations.", latest?.capitalExpenditures),
+    derived(Math.max(capexPercent.at(-1) ?? 0, median(capexPercent.slice(-5)) ?? 0), "Capex / revenue", "%", "Higher of latest reported intensity and five-year median. This conservative investment-cycle assumption prevents a historical median from erasing a current capex step-up. Review management's spending plan and the transition to terminal reinvestment.", latest?.capitalExpenditures),
     0.03,
     "Capex / revenue",
     "%",
@@ -416,6 +431,17 @@ export async function buildModelPayload(ticker: string): Promise<ModelPayload> {
     "%",
     "25.0% is used because no stable normalized effective tax rate was available.",
   );
+  let projectionBase: ModelPayload["projectionBase"];
+  if (elapsedYears && latest?.revenue.value != null) {
+    let revenue = latest.revenue.value;
+    for (const growth of forecast.revenueGrowth.slice(0, elapsedYears)) revenue *= 1 + (growth.value ?? 0);
+    const endDate = addFiscalYears(latest.period.endDate, elapsedYears);
+    projectionBase = {
+      endDate,
+      revenue: derived(revenue, "Estimated opening revenue", "$mm", `Unreported elapsed fiscal year ending ${endDate}, rolled forward using dated consensus or the disclosed historical-growth assumption. Not reported actuals.`, forecast.revenueGrowth[elapsedYears - 1]),
+      netWorkingCapital: derived(revenue * (nwcSeed.value ?? 0), "Estimated opening operating NWC", "$mm", "Estimated opening revenue multiplied by normalized operating NWC / revenue; not reported actuals.", nwcSeed),
+    };
+  }
   const roicObservation = terminalRoic(annual, taxSeed.value);
   const roicSeed = roicObservation.value !== null && roicObservation.value > terminalGrowth.value! + 0.01
     ? derived(
@@ -492,10 +518,10 @@ export async function buildModelPayload(ticker: string): Promise<ModelPayload> {
 
   const assumptions: ProjectionAssumptions = {
     projectionYears,
-    valuationDate: new Date().toISOString().slice(0, 10),
+    valuationDate,
     discountingConvention: "mid-year",
-    revenueGrowth: forecast.revenueGrowth,
-    ebitMargin: forecast.ebitMargin,
+    revenueGrowth: forecast.revenueGrowth.slice(elapsedYears),
+    ebitMargin: forecast.ebitMargin.slice(elapsedYears),
     depreciationAmortizationPctRevenue: repeated(daSeed, projectionYears),
     stockBasedCompensationPctRevenue: repeated(sbcSeed, projectionYears),
     capitalExpendituresPctRevenue: repeated(capexSeed, projectionYears),
@@ -519,10 +545,13 @@ export async function buildModelPayload(ticker: string): Promise<ModelPayload> {
   };
 
   const gaps: DataGap[] = [];
+  if (projectionBase) gaps.push({ field: "Estimated opening fiscal year", reason: projectionBase.revenue.provenance.notes!, severity: elapsedYears > 1 ? "blocking" : "review", affectedOutputs: ["Forecast revenue", "DCF"] });
+  gaps.push({ field: "Investment-cycle assumption", reason: capexSeed.provenance.notes!, severity: "review", affectedOutputs: ["Forecast capex", "DCF"] });
+  gaps.push({ field: "Balance-sheet classifications", reason: `Equity bridge uses the latest available field, preferably ${balancePeriod?.period.endDate ?? "annual"}. Review operating cash, lease separation, non-operating investments and debt-like claims. Standardized classifications are not independent filing verification.`, severity: "review", affectedOutputs: ["Equity bridge"] });
   if (filingFallbackReason) {
     gaps.push({
       field: "Primary SEC Company Facts source",
-      reason: `${filingFallbackReason} Standardized FMP filing data was used as a fallback; reconcile material values to the linked SEC filing before relying on the output.`,
+      reason: `${filingFallbackReason} Standardized FMP statements were used; provider links do not constitute independent SEC verification. Reconcile material values to the issuer filing.`,
       severity: "warning",
       affectedOutputs: ["Source audit", "Historical financials"],
     });
@@ -552,7 +581,7 @@ export async function buildModelPayload(ticker: string): Promise<ModelPayload> {
   } else {
     gaps.push({
       field: "Interim / stub integration",
-      reason: `${sec.historicals.latestInterim.period.label} is displayed for review but is not automatically spliced into an LTM base. The first forecast period is date-weighted from the latest annual case; reconcile the reported interim and remaining stub before circulation.`,
+      reason: `${sec.historicals.latestInterim.period.label} supplies the latest balance-sheet bridge. Operating forecasts are full-year cases, not LTM; first-period FCFF is time-weighted. Review seasonality and reconcile the remaining stub to reported interim results before circulation.`,
       severity: "review",
       affectedOutputs: ["First forecast period", "DCF"],
     });
@@ -644,6 +673,7 @@ export async function buildModelPayload(ticker: string): Promise<ModelPayload> {
     generatedAt: new Date().toISOString(),
     identity: sec.identity,
     historicals: sec.historicals,
+    projectionBase,
     market,
     assumptions,
     bridge,

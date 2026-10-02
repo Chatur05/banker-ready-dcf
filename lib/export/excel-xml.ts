@@ -6,6 +6,7 @@ import type {
   ProjectionAssumptions,
   TaggedValue,
 } from "../model/types";
+import { calculateDcf } from "../model/valuation";
 
 const COLORS = {
   navy: "0B1F33",
@@ -60,7 +61,7 @@ function applyTitle(sheet: WorkbookSheet, title: string, subtitle: string, endCo
   subtitleCell.font = { name: "Arial", size: 9, italic: true, color: { argb: "FF666666" } };
   subtitleCell.alignment = { wrapText: true, vertical: "middle" };
   sheet.getRow(2).height = 27;
-  sheet.views = [{ state: "frozen", xSplit: 1, ySplit: 3 }];
+  sheet.views = [{ state: "frozen", xSplit: 1, ySplit: 3, showGridLines: false }];
   sheet.properties.defaultRowHeight = 16;
   sheet.pageSetup = { orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0, paperSize: 9 };
   sheet.pageSetup.printTitlesRow = "1:4";
@@ -229,6 +230,7 @@ function addAssumptions(
     });
     row += 1;
   });
+  formulaCell(cells.equityWeight, `1-${cells.debtWeight.address}-${cells.preferredWeight.address}`, assumptions.equityWeight.value, formats.percent);
   sectionRow(sheet, row, "Market and enterprise-to-equity bridge", endColumn);
   row += 1;
   const bridgeItems: Array<[string, string, TaggedValue, string]> = [
@@ -257,12 +259,16 @@ function addAssumptions(
     cells[key] = cell;
     row += 1;
   });
+  labelCell(sheet.getCell(row, 1), "SBC add-back (1=yes, 0=no)");
+  cells.stockCompensationAddBack = sheet.getCell(row, 2);
+  inputCell(cells.stockCompensationAddBack, { value: assumptions.stockCompensationAddBack ? 1 : 0, provenance: { origin: "user", label: "SBC add-back", notes: "Adding back SBC requires a separate future dilution or cash replacement assumption." } }, formats.integer);
+  cells.stockCompensationAddBack.dataValidation = { type: "whole", operator: "between", formulae: [0, 1], allowBlank: false, showErrorMessage: true };
   sheet.autoFilter = { from: { row: 4, column: 1 }, to: { row: 11, column: endColumn } };
   sheet.pageSetup.fitToHeight = 1;
   return { sheet, cells, seriesRows };
 }
 
-function addHistoricals(workbook: ExcelJS.Workbook, payload: ModelPayload): { sheet: WorkbookSheet; latestRevenue: WorkbookCell; latestNwc: WorkbookCell } {
+function addHistoricals(workbook: ExcelJS.Workbook, payload: ModelPayload, assumptionsSheet: WorkbookSheet, nwcAssumption: WorkbookCell): { sheet: WorkbookSheet; latestRevenue: WorkbookCell; latestNwc: WorkbookCell } {
   const sheet = workbook.addWorksheet("Historicals", { properties: { tabColor: { argb: "FF70AD47" } } });
   const periods = payload.historicals.annual;
   applyTitle(sheet, "HISTORICALS — FILING BASE", `${payload.identity.name} | $ in millions except per-share data | Click source URLs in the Sources Audit tab`, periods.length + 1);
@@ -283,15 +289,30 @@ function addHistoricals(workbook: ExcelJS.Workbook, payload: ModelPayload): { sh
     const value = [period.accountsReceivable, period.inventory, period.otherCurrentAssets, period.accountsPayable, period.deferredRevenue, period.otherCurrentLiabilities].every((item) => item.value !== null)
       ? period.accountsReceivable.value! + period.inventory.value! + period.otherCurrentAssets.value! - period.accountsPayable.value! - period.deferredRevenue.value! - period.otherCurrentLiabilities.value!
       : null;
-    formulaCell(sheet.getCell(nwcRow, column), `${sheet.getCell(11, column).address}+${sheet.getCell(12, column).address}+${sheet.getCell(13, column).address}-${sheet.getCell(14, column).address}-${sheet.getCell(15, column).address}-${sheet.getCell(16, column).address}`, value);
+    formulaCell(sheet.getCell(nwcRow, column), `IF(COUNT(${sheet.getCell(11, column).address}:${sheet.getCell(16, column).address})=6,${sheet.getCell(11, column).address}+${sheet.getCell(12, column).address}+${sheet.getCell(13, column).address}-${sheet.getCell(14, column).address}-${sheet.getCell(15, column).address}-${sheet.getCell(16, column).address},NA())`, value);
   });
   totalRow(sheet, nwcRow, periods.length + 1);
   const sourceRow = nwcRow + 2;
   labelCell(sheet.getCell(sourceRow, 1), "Accession number");
-  periods.forEach((period, index) => { sheet.getCell(sourceRow, index + 2).value = period.period.accessionNumber; });
+  periods.forEach((period, index) => { sheet.getCell(sourceRow, index + 2).value = period.period.accessionNumber || "Not supplied"; });
   labelCell(sheet.getCell(sourceRow + 1, 1), "Filing date");
   periods.forEach((period, index) => { sheet.getCell(sourceRow + 1, index + 2).value = period.period.filingDate.slice(0, 10); });
-  return { sheet, latestRevenue: sheet.getCell(5, periods.length + 1), latestNwc: sheet.getCell(nwcRow, periods.length + 1) };
+  sectionRow(sheet, 23, `Forecast opening base (${payload.projectionBase ? "ESTIMATED, NOT REPORTED" : "latest annual"})`, periods.length + 1);
+  labelCell(sheet.getCell("A24"), "Opening fiscal date"); sheet.getCell("B24").value = payload.projectionBase?.endDate ?? periods.at(-1)?.period.endDate;
+  labelCell(sheet.getCell("A25"), "Opening revenue");
+  labelCell(sheet.getCell("A26"), "Opening operating NWC");
+  if (payload.projectionBase) {
+    inputCell(sheet.getCell("B25"), payload.projectionBase.revenue, formats.amount);
+    inputCell(sheet.getCell("B26"), payload.projectionBase.netWorkingCapital, formats.amount);
+  } else {
+    formulaCell(sheet.getCell("B25"), sheet.getCell(5, periods.length + 1).address, periods.at(-1)!.revenue.value);
+    const lastNwc = sheet.getCell(nwcRow, periods.length + 1);
+    const last = periods.at(-1)!;
+    const complete = [last.accountsReceivable, last.inventory, last.otherCurrentAssets, last.accountsPayable, last.deferredRevenue, last.otherCurrentLiabilities].every((item) => item.value !== null);
+    if (complete) formulaCell(sheet.getCell("B26"), lastNwc.address, (lastNwc.value as ExcelJS.CellFormulaValue).result as number);
+    else formulaCell(sheet.getCell("B26"), `B25*${ref(assumptionsSheet, nwcAssumption)}`, last.revenue.value! * Number(nwcAssumption.value));
+  }
+  return { sheet, latestRevenue: sheet.getCell("B25"), latestNwc: sheet.getCell("B26") };
 }
 
 function addProjection(
@@ -303,6 +324,7 @@ function addProjection(
   latestRevenue: WorkbookCell,
   latestNwc: WorkbookCell,
   historicalsSheet: WorkbookSheet,
+  sbcControl: WorkbookCell,
 ): { sheet: WorkbookSheet; rows: Record<string, number> } {
   const sheet = workbook.addWorksheet("Projection Model", { properties: { tabColor: { argb: "FF4472C4" } } });
   const projections = result.projections;
@@ -315,21 +337,22 @@ function addProjection(
   projections.forEach((projection, index) => {
     const column = index + 2;
     const a = (key: string) => `${quotedSheet(assumptionsSheet.name)}!${assumptionsSheet.getCell(seriesRows[key], column).address}`;
-    formulaCell(sheet.getCell(rows["Revenue growth"], column), a("revenueGrowth"), projection.growth, formats.percent);
+    const checked = (key: string, low: number, high: number) => `IF(AND(ISNUMBER(${a(key)}),${a(key)}>=${low},${a(key)}<=${high}),${a(key)},NA())`;
+    formulaCell(sheet.getCell(rows["Revenue growth"], column), checked("revenueGrowth", -0.95, 1), projection.growth, formats.percent);
     const priorRevenue = index === 0 ? ref(historicalsSheet, latestRevenue) : sheet.getCell(rows["Revenue"], column - 1).address;
     formulaCell(sheet.getCell(rows["Revenue"], column), `${priorRevenue}*(1+${sheet.getCell(rows["Revenue growth"], column).address})`, projection.revenue);
-    formulaCell(sheet.getCell(rows["EBIT margin"], column), a("ebitMargin"), projection.ebitMargin, formats.percent);
+    formulaCell(sheet.getCell(rows["EBIT margin"], column), checked("ebitMargin", -1, 1), projection.ebitMargin, formats.percent);
     formulaCell(sheet.getCell(rows["EBIT"], column), `${sheet.getCell(rows["Revenue"], column).address}*${sheet.getCell(rows["EBIT margin"], column).address}`, projection.ebit);
-    formulaCell(sheet.getCell(rows["Operating tax rate"], column), a("operatingTaxRate"), assumptions.operatingTaxRate[index].value, formats.percent);
+    formulaCell(sheet.getCell(rows["Operating tax rate"], column), checked("operatingTaxRate", 0, 0.6), assumptions.operatingTaxRate[index].value, formats.percent);
     formulaCell(sheet.getCell(rows["Cash taxes"], column), `MAX(0,${sheet.getCell(rows["EBIT"], column).address}*${sheet.getCell(rows["Operating tax rate"], column).address})`, projection.cashTaxes);
     formulaCell(sheet.getCell(rows.NOPAT, column), `${sheet.getCell(rows.EBIT, column).address}-${sheet.getCell(rows["Cash taxes"], column).address}`, projection.nopat);
-    formulaCell(sheet.getCell(rows["D&A"], column), `${sheet.getCell(rows.Revenue, column).address}*${a("depreciationAmortizationPctRevenue")}`, projection.depreciationAmortization);
-    formulaCell(sheet.getCell(rows["Stock-based compensation"], column), `${sheet.getCell(rows.Revenue, column).address}*${a("stockBasedCompensationPctRevenue")}`, projection.stockBasedCompensation);
-    formulaCell(sheet.getCell(rows["Capital expenditures"], column), `${sheet.getCell(rows.Revenue, column).address}*${a("capitalExpendituresPctRevenue")}`, projection.capitalExpenditures);
-    formulaCell(sheet.getCell(rows["Operating NWC"], column), `${sheet.getCell(rows.Revenue, column).address}*${a("netWorkingCapitalPctRevenue")}`, projection.netWorkingCapital);
+    formulaCell(sheet.getCell(rows["D&A"], column), `${sheet.getCell(rows.Revenue, column).address}*${checked("depreciationAmortizationPctRevenue", 0, 1)}`, projection.depreciationAmortization);
+    formulaCell(sheet.getCell(rows["Stock-based compensation"], column), `${sheet.getCell(rows.Revenue, column).address}*${checked("stockBasedCompensationPctRevenue", 0, 1)}`, projection.stockBasedCompensation);
+    formulaCell(sheet.getCell(rows["Capital expenditures"], column), `${sheet.getCell(rows.Revenue, column).address}*${checked("capitalExpendituresPctRevenue", 0, 1)}`, projection.capitalExpenditures);
+    formulaCell(sheet.getCell(rows["Operating NWC"], column), `${sheet.getCell(rows.Revenue, column).address}*${checked("netWorkingCapitalPctRevenue", -1, 1)}`, projection.netWorkingCapital);
     const priorNwc = index === 0 ? ref(historicalsSheet, latestNwc) : sheet.getCell(rows["Operating NWC"], column - 1).address;
     formulaCell(sheet.getCell(rows["Change in operating NWC"], column), `${sheet.getCell(rows["Operating NWC"], column).address}-${priorNwc}`, projection.changeInNetWorkingCapital);
-    const sbcAddback = assumptions.stockCompensationAddBack ? `+${sheet.getCell(rows["Stock-based compensation"], column).address}` : "";
+    const sbcAddback = `+IF(${ref(assumptionsSheet, sbcControl)}=1,${sheet.getCell(rows["Stock-based compensation"], column).address},0)`;
     formulaCell(sheet.getCell(rows["Full-year unlevered FCF"], column), `${sheet.getCell(rows.NOPAT, column).address}+${sheet.getCell(rows["D&A"], column).address}-${sheet.getCell(rows["Capital expenditures"], column).address}-${sheet.getCell(rows["Change in operating NWC"], column).address}${sbcAddback}`, projection.fullYearUnleveredFreeCashFlow);
     formulaCell(sheet.getCell(rows["Stub fraction"], column), String(projection.stubFraction), projection.stubFraction, formats.percent);
     formulaCell(sheet.getCell(rows["Unlevered FCF"], column), `${sheet.getCell(rows["Full-year unlevered FCF"], column).address}*${sheet.getCell(rows["Stub fraction"], column).address}`, projection.unleveredFreeCashFlow);
@@ -360,7 +383,12 @@ function addWacc(
   formulaCell(sheet.getCell(10, 2), "B5+B6*B7+B8+B9", result.costOfEquity, formats.percent); totalRow(sheet, 10, 2);
   sectionRow(sheet, 12, "Debt, preferred equity and capital weights", 3);
   const linkRows: Array<[number, string, string, string]> = [[13, "Pre-tax cost of debt", "preTaxCostOfDebt", formats.percent], [14, "Usable interest tax rate", "usableInterestTaxRate", formats.percent], [16, "Debt weight", "debtWeight", formats.percent], [17, "Equity weight", "equityWeight", formats.percent], [18, "Preferred weight", "preferredWeight", formats.percent], [19, "Preferred cost", "preferredCost", formats.percent]];
-  linkRows.forEach(([row, label, key, numFmt]) => { labelCell(sheet.getCell(row, 1), label); formulaCell(sheet.getCell(row, 2), ref(assumptionsSheet, assumptionCells[key]), assumptionCells[key].value as number | null, numFmt); });
+  linkRows.forEach(([row, label, key, numFmt]) => {
+    labelCell(sheet.getCell(row, 1), label);
+    const cellValue = assumptionCells[key].value;
+    const cached = typeof cellValue === "object" && cellValue && "formula" in cellValue ? cellValue.result as number | null : cellValue as number | null;
+    formulaCell(sheet.getCell(row, 2), ref(assumptionsSheet, assumptionCells[key]), cached, numFmt);
+  });
   labelCell(sheet.getCell(15, 1), "After-tax cost of debt", true); formulaCell(sheet.getCell(15, 2), "B13*(1-B14)", result.afterTaxCostOfDebt, formats.percent); totalRow(sheet, 15, 2);
   labelCell(sheet.getCell(21, 1), "WACC", true); formulaCell(sheet.getCell(21, 2), "B17*B10+B16*B15+B18*B19", result.wacc, formats.percent); totalRow(sheet, 21, 2, true);
   sheet.getCell("C21").value = "Must exceed terminal growth; capital weights must sum to 100%.";
@@ -415,7 +443,10 @@ function addValuation(
   formulaCell(sheet.getCell(41, 2), optionsFormula, incrementalOptions, formats.shares);
   labelCell(sheet.getCell(42, 1), "RSUs / dilution proxy"); formulaCell(sheet.getCell(42, 2), ref(assumptionsSheet, assumptionCells.rsus), bridge.rsus.value, formats.shares);
   labelCell(sheet.getCell(43, 1), "Fully diluted shares", true); formulaCell(sheet.getCell(43, 2), "SUM(B40:B42)", result.fullyDilutedShares, formats.shares); totalRow(sheet, 43, 2);
-  labelCell(sheet.getCell(44, 1), "Implied share price — Gordon", true); formulaCell(sheet.getCell(44, 2), "B37/B43", result.impliedSharePriceGordon, formats.price); totalRow(sheet, 44, 2, true);
+  labelCell(sheet.getCell(44, 1), "Implied share price — Gordon", true); formulaCell(sheet.getCell(44, 2), "IF(AND(B37>0,B43>0),B37/B43,NA())", result.impliedSharePriceGordon, formats.price); totalRow(sheet, 44, 2, true);
+  // Own the terminal gate here, not in the downstream Checks sheet. Invalid
+  // edits remain visibly unavailable instead of yielding a plausible share price.
+  formulaCell(sheet.getCell("B11"), `IF(AND(B10>MAX(0,B5),B5>=-0.05,B5<=0.10,B6>B5,B6>=0.01,B6<=1,${p("NOPAT")}>0,${p("Full-year unlevered FCF")}>0),B9/(B10-B5),NA())`, result.terminalValueGordon);
   labelCell(sheet.getCell(45, 1), "Current market price"); formulaCell(sheet.getCell(45, 2), ref(assumptionsSheet, assumptionCells.currentPrice), assumptionCells.currentPrice.value as number | null, formats.price);
   labelCell(sheet.getCell(46, 1), "Upside / (downside)"); formulaCell(sheet.getCell(46, 2), "IF(B45>0,B44/B45-1,\"\")", result.upsideDownsideGordon, formats.percent);
   sheet.getCell("D44").value = "Calculation complete does not mean approved. Resolve review flags in Checks and Sources Audit before circulation.";
@@ -440,21 +471,26 @@ function addSensitivity(
   const waccs = [-0.01, -0.005, 0, 0.005, 0.01].map((delta) => (result.wacc ?? 0) + delta);
   const growths = [-0.01, -0.005, 0, 0.005, 0.01].map((delta) => (assumptions.terminalGrowth.value ?? 0) + delta);
   headerRow(sheet, 4, ["Terminal g / WACC", ...waccs]);
-  waccs.forEach((value, index) => { sheet.getCell(4, index + 2).value = value; sheet.getCell(4, index + 2).numFmt = formats.percent; });
+  waccs.forEach((value, index) => {
+    const cell = sheet.getCell(4, index + 2);
+    formulaCell(cell, `${quotedSheet(valuationSheet.name)}!$B$10+${[-0.01, -0.005, 0, 0.005, 0.01][index]}`, value, formats.percent);
+    cell.font = { name: "Arial", size: 10, bold: true, color: { argb: "FFFFFFFF" } };
+  });
   const finalColumn = result.projections.length + 1;
   const terminalPeriod = result.terminalDiscountPeriod ?? 0;
   const explicitFormula = (waccAddress: string) => `SUMPRODUCT(${quotedSheet(projectionSheet.name)}!${projectionSheet.getCell(projectionRows["Unlevered FCF"], 2).address}:${quotedSheet(projectionSheet.name)}!${projectionSheet.getCell(projectionRows["Unlevered FCF"], finalColumn).address},1/(1+${waccAddress})^${quotedSheet(projectionSheet.name)}!${projectionSheet.getCell(projectionRows["Discount period"], 2).address}:${quotedSheet(projectionSheet.name)}!${projectionSheet.getCell(projectionRows["Discount period"], finalColumn).address})`;
   growths.forEach((growth, rowIndex) => {
     const row = 5 + rowIndex;
-    sheet.getCell(row, 1).value = growth; sheet.getCell(row, 1).numFmt = formats.percent;
+    formulaCell(sheet.getCell(row, 1), `${quotedSheet(valuationSheet.name)}!$B$5+${[-0.01, -0.005, 0, 0.005, 0.01][rowIndex]}`, growth, formats.percent);
     waccs.forEach((wacc, columnIndex) => {
       const column = 2 + columnIndex;
       const waccAddress = `${sheet.getColumn(column).letter}$4`;
       const growthAddress = `$A${row}`;
       const finalNopat = `${quotedSheet(projectionSheet.name)}!${projectionSheet.getCell(projectionRows.NOPAT, finalColumn).address}`;
-      const formula = `(${explicitFormula(waccAddress)}+(${finalNopat}*(1+${growthAddress})*(1-${growthAddress}/${assumptions.terminalRoic.value ?? 0.1}))/(${waccAddress}-${growthAddress})/(1+${waccAddress})^${terminalPeriod}+${ref(valuationSheet, bridgeAdjustments)})/${ref(valuationSheet, dilutedShares)}`;
+      const roic = `${quotedSheet(valuationSheet.name)}!$B$6`;
+      const formula = `IF(AND(${waccAddress}>MAX(0,${growthAddress}),${roic}>${growthAddress},${roic}>0,${ref(valuationSheet, dilutedShares)}>0,ISNUMBER(${quotedSheet(valuationSheet.name)}!$B$44)),(${explicitFormula(waccAddress)}+(${finalNopat}*(1+${growthAddress})*(1-${growthAddress}/${roic}))/(${waccAddress}-${growthAddress})/(1+${waccAddress})^${terminalPeriod}+${ref(valuationSheet, bridgeAdjustments)})/${ref(valuationSheet, dilutedShares)},NA())`;
       const value = (() => {
-        if (!result.projections.length || result.bridgeAdjustments === null || !result.fullyDilutedShares || wacc <= growth || assumptions.terminalRoic.value === null) return null;
+        if (!result.projections.length || result.bridgeAdjustments === null || !result.fullyDilutedShares || wacc <= Math.max(0, growth) || assumptions.terminalRoic.value === null || assumptions.terminalRoic.value <= growth) return null;
         const explicit = result.projections.reduce((sum, year) => sum + year.unleveredFreeCashFlow / (1 + wacc) ** year.discountPeriod, 0);
         const final = result.projections.at(-1)!;
         const terminal = final.nopat * (1 + growth) * (1 - growth / assumptions.terminalRoic.value) / (wacc - growth);
@@ -476,6 +512,8 @@ function addSources(workbook: ExcelJS.Workbook, payload: ModelPayload, assumptio
   payload.historicals.annual.forEach((period) => {
     entries.push([`${period.period.label} revenue`, period.revenue], [`${period.period.label} EBIT`, period.ebit], [`${period.period.label} D&A`, period.depreciationAmortization], [`${period.period.label} capex`, period.capitalExpenditures]);
   });
+  if (payload.projectionBase) entries.push(["Estimated opening revenue", payload.projectionBase.revenue], ["Estimated opening NWC", payload.projectionBase.netWorkingCapital]);
+  for (const key of ["revenueGrowth", "ebitMargin", "capitalExpendituresPctRevenue", "netWorkingCapitalPctRevenue"] as const) assumptions[key].forEach((value, index) => entries.push([`${key} forecast ${index + 1}`, value]));
   entries.push(...([
     ["Risk-free rate", assumptions.riskFreeRate], ["Equity risk premium", assumptions.equityRiskPremium], ["Levered beta", assumptions.releveredBeta], ["Pre-tax cost of debt", assumptions.preTaxCostOfDebt], ["Terminal growth", assumptions.terminalGrowth], ["Terminal ROIC", assumptions.terminalRoic], ["Exit multiple", assumptions.exitMultiple], ...Object.entries(bridge).map(([key, value]) => [key, value] as [string, TaggedValue]),
   ] as Array<[string, TaggedValue]>));
@@ -533,23 +571,38 @@ function addChecks(
     const ok = operator === "equal" ? Math.abs(actual - threshold) < 0.0001 : operator === "less" ? actual <= threshold : actual > threshold;
     const reviewOnly = ["Terminal value / enterprise value", "Open judgment / source review flags"].includes(label);
     const status = ok ? "OK" : reviewOnly ? "REVIEW" : "FAIL";
-    sheet.getCell(row, 5).value = status;
+    const condition = operator === "equal" ? `ABS(B${row}-C${row})<0.0001` : operator === "less" ? `B${row}<=C${row}` : `B${row}>C${row}`;
+    formulaCell(sheet.getCell(row, 5), `IF(ISNUMBER(B${row}),IF(${condition},"OK","${reviewOnly ? "REVIEW" : "FAIL"}"),"FAIL")`, status, "General");
     sheet.getCell(row, 5).font = { name: "Arial", bold: true, color: { argb: status === "OK" ? "FF006100" : status === "REVIEW" ? "FF9C6500" : "FF9C0006" } };
     sheet.getCell(row, 5).fill = { type: "pattern", pattern: "solid", fgColor: { argb: status === "OK" ? `FF${COLORS.green}` : status === "REVIEW" ? "FFFFEB9C" : `FF${COLORS.red}` } };
     sheet.getCell(row, 6).value = note;
+    sheet.getCell(row, 6).alignment = { wrapText: true, vertical: "middle" };
+    sheet.getRow(row).height = 30;
   });
+  formulaCell(sheet.getCell("B5"), `IF(ISNUMBER(${ref(valuationSheet, sharePrice)}),0,1)`, result.errors.length, formats.integer);
+  sheet.getCell("A5").value = "Valuation output availability";
+  sheet.getCell("F5").value = "Live output check; not a substitute for reviewing all Excel input edits. Full input validation is performed when rebuilding in the app.";
+  formulaCell(sheet.getCell("B6"), `SUM(${quotedSheet(waccSheet.name)}!B16:B18)`, 1, formats.percent);
+  formulaCell(sheet.getCell("B7"), `${ref(waccSheet, waccCell)}-${quotedSheet(valuationSheet.name)}!B5`, result.wacc! - assumptions.terminalGrowth.value!, formats.percent);
+  formulaCell(sheet.getCell("B8"), `${quotedSheet(valuationSheet.name)}!B7`, result.terminalReinvestmentRate, formats.percent);
+  formulaCell(sheet.getCell("B9"), `${quotedSheet(valuationSheet.name)}!B18`, result.terminalValuePctEnterpriseValue, formats.percent);
+  formulaCell(sheet.getCell("B10"), ref(valuationSheet, sharePrice), result.impliedSharePriceGordon, formats.price);
+  sheet.addConditionalFormatting({ ref: "E5:E11", rules: [
+    { type: "containsText", operator: "containsText", text: "FAIL", priority: 1, style: { font: { color: { argb: "FF9C0006" }, bold: true }, fill: { type: "pattern", pattern: "solid", bgColor: { argb: "FFFFC7CE" } } } },
+    { type: "containsText", operator: "containsText", text: "REVIEW", priority: 2, style: { font: { color: { argb: "FF9C6500" } }, fill: { type: "pattern", pattern: "solid", bgColor: { argb: "FFFFEB9C" } } } },
+  ] });
   sectionRow(sheet, 14, "Detailed review flags", 6);
-  payload.gaps.forEach((gap, index) => {
+  [...payload.gaps, ...result.warnings.map((reason) => ({ field: "Model review", reason, severity: "warning", affectedOutputs: ["DCF"] }))].forEach((gap, index) => {
     const row = 15 + index;
     sheet.getCell(row, 1).value = gap.field;
     sheet.getCell(row, 2).value = gap.severity.toUpperCase();
     sheet.mergeCells(row, 3, row, 6);
     sheet.getCell(row, 3).value = `${gap.reason} Affects: ${gap.affectedOutputs.join(", ")}.`;
     sheet.getCell(row, 3).alignment = { wrapText: true, vertical: "top" };
-    sheet.getRow(row).height = 31;
+    sheet.getRow(row).height = Math.max(31, Math.ceil((gap.reason.length + 60) / 130) * 14);
   });
   sheet.getCell("F5").note = `WACC reference: ${ref(waccSheet, waccCell)} | Per-share reference: ${ref(valuationSheet, sharePrice)}`;
-  sheet.pageSetup.fitToHeight = 1;
+  sheet.pageSetup.fitToHeight = 0;
 }
 
 export async function buildExcelWorkbook(
@@ -558,6 +611,8 @@ export async function buildExcelWorkbook(
   bridge: EquityBridge,
   result: DcfResult,
 ): Promise<Uint8Array> {
+  result = calculateDcf(payload, assumptions, bridge);
+  if (!result.ready) throw new Error(`Export blocked: ${result.errors.join(" ")}`);
   const workbook = new ExcelJS.Workbook();
   workbook.creator = "Banker Ready DCF";
   workbook.lastModifiedBy = "Banker Ready DCF";
@@ -566,8 +621,8 @@ export async function buildExcelWorkbook(
   workbook.calcProperties.fullCalcOnLoad = true;
   addCover(workbook, payload, assumptions, result);
   const assumptionBuild = addAssumptions(workbook, payload, assumptions, bridge);
-  const historicalBuild = addHistoricals(workbook, payload);
-  const projectionBuild = addProjection(workbook, assumptions, result, assumptionBuild.sheet, assumptionBuild.seriesRows, historicalBuild.latestRevenue, historicalBuild.latestNwc, historicalBuild.sheet);
+  const historicalBuild = addHistoricals(workbook, payload, assumptionBuild.sheet, assumptionBuild.sheet.getCell(assumptionBuild.seriesRows.netWorkingCapitalPctRevenue, 2));
+  const projectionBuild = addProjection(workbook, assumptions, result, assumptionBuild.sheet, assumptionBuild.seriesRows, historicalBuild.latestRevenue, historicalBuild.latestNwc, historicalBuild.sheet, assumptionBuild.cells.stockCompensationAddBack);
   const waccBuild = addWacc(workbook, assumptionBuild.sheet, assumptionBuild.cells, result);
   result.projections.forEach((projection, index) => {
     const column = index + 2;
@@ -575,6 +630,8 @@ export async function buildExcelWorkbook(
     formulaCell(projectionBuild.sheet.getCell(projectionBuild.rows["PV of unlevered FCF"], column), `${projectionBuild.sheet.getCell(projectionBuild.rows["Unlevered FCF"], column).address}*${projectionBuild.sheet.getCell(projectionBuild.rows["Discount factor"], column).address}`, projection.presentValueOfFreeCashFlow);
   });
   const valuationBuild = addValuation(workbook, assumptions, bridge, result, assumptionBuild.sheet, assumptionBuild.cells, projectionBuild.sheet, projectionBuild.rows, waccBuild.sheet, waccBuild.wacc);
+  for (const [address, formula, value] of [["B9", "'Valuation Summary'!B44", result.impliedSharePriceGordon], ["C9", "'Valuation Summary'!B45", payload.market.currentPrice.value], ["D9", "'Valuation Summary'!B10", result.wacc], ["E9", "'Valuation Summary'!B18", result.terminalValuePctEnterpriseValue]] as const) workbook.getWorksheet("Cover")!.getCell(address).value = { formula, result: value ?? undefined };
+  formulaCell(workbook.getWorksheet("Cover")!.getCell("B12"), `IF(ISNUMBER('Valuation Summary'!B44),"CALCULATED - REVIEW REQUIRED","BLOCKED - REVIEW INPUTS")`, "CALCULATED - REVIEW REQUIRED", "General");
   addSensitivity(workbook, assumptions, result, projectionBuild.sheet, projectionBuild.rows, valuationBuild.sheet, valuationBuild.bridgeAdjustments, valuationBuild.dilutedShares);
   addSources(workbook, payload, assumptions, bridge);
   addChecks(workbook, payload, assumptions, result, waccBuild.sheet, waccBuild.wacc, valuationBuild.sheet, valuationBuild.sharePrice);

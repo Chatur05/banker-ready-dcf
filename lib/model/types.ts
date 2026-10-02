@@ -170,6 +170,8 @@ export type ModelPayload = {
   generatedAt: string;
   identity: CompanyIdentity;
   historicals: HistoricalFinancials;
+  /** Estimated roll-forward of an elapsed fiscal year; never presented as a filing. */
+  projectionBase?: { endDate: string; revenue: TaggedValue; netWorkingCapital: TaggedValue };
   market: MarketInputs;
   assumptions: ProjectionAssumptions;
   bridge: EquityBridge;
