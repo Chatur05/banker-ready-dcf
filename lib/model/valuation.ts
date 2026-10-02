@@ -66,7 +66,9 @@ function validateScalarRange(
 }
 
 function bridgeValue(value: TaggedValue, label: string, errors: string[]): number | null {
-  return number(value, `Bridge item: ${label}`, errors);
+  const parsed = number(value, `Bridge item: ${label}`, errors);
+  if (parsed !== null && parsed < 0) errors.push(`Bridge item: ${label} cannot be negative.`);
+  return parsed;
 }
 
 function fullyDilutedShares(
@@ -141,10 +143,19 @@ export function calculateDcf(
   }
   if (!latest) errors.push("At least one annual filing period is required.");
   if (annual.length > 0 && annual.length < 3) errors.push("At least three annual filing periods are required for the automatic FCFF case.");
-  const projectionYears = assumptions.projectionYears;
-  if (projectionYears < 5 || projectionYears > 10) {
-    errors.push("Projection period must be between five and ten years.");
+  const validHorizon = Number.isInteger(assumptions.projectionYears) && assumptions.projectionYears >= 5 && assumptions.projectionYears <= 10;
+  const projectionYears = validHorizon ? assumptions.projectionYears : 5;
+  if (!validHorizon) {
+    errors.push("Projection period must be a whole number between five and ten years.");
   }
+  const isDate = (date: string) => /^\d{4}-\d{2}-\d{2}$/.test(date) && Number.isFinite(Date.parse(date)) && new Date(date).toISOString().slice(0, 10) === date;
+  const baseEnd = payload.projectionBase?.endDate ?? latest?.period.endDate ?? "";
+  const validDates = isDate(assumptions.valuationDate) && isDate(baseEnd);
+  if (!validDates) errors.push("A valid valuation date and opening fiscal date are required.");
+  if (validDates && (assumptions.valuationDate < baseEnd || assumptions.valuationDate >= addFiscalYears(baseEnd, 1))) {
+    errors.push("Valuation date is outside the loaded forecast's fiscal year. Refresh company data to realign the opening base and consensus periods.");
+  }
+  if (latest && isDate(latest.period.endDate) && validDates && yearFraction(latest.period.endDate, assumptions.valuationDate) > 2) errors.push("Annual statements are more than two years old; fresh financials are required.");
 
   const growth = series(assumptions.revenueGrowth, projectionYears, "Revenue growth", errors);
   const margins = series(assumptions.ebitMargin, projectionYears, "EBIT margin", errors);
@@ -196,7 +207,7 @@ export function calculateDcf(
   const terminalRoic = number(assumptions.terminalRoic, "Terminal ROIC", errors);
   const exitMultiple = optionalNumber(assumptions.exitMultiple);
   const currentPrice = optionalNumber(payload.market.currentPrice);
-  if (exitMultiple === null) warnings.push("Exit-multiple cross-check is unavailable; the primary Gordon-growth valuation remains calculable.");
+  if (exitMultiple === null) warnings.push("Exit-multiple cross-check is unavailable; Gordon-growth is the primary method and remains subject to all critical checks.");
   if (currentPrice === null) warnings.push("Current market price is unavailable; upside/downside is omitted.");
   validateScalarRange(riskFree, "Risk-free rate", -0.02, 0.25, errors);
   validateScalarRange(erp, "Equity risk premium", 0, 0.25, errors);
@@ -213,7 +224,9 @@ export function calculateDcf(
   if (preferredCost !== null && (preferredCost < 0 || preferredCost > 0.40)) errors.push("Preferred cost must be between 0% and 40%.");
   if (exitMultiple !== null && (exitMultiple <= 0 || exitMultiple > 50)) errors.push("Exit EV / EBITDA must be greater than 0.0x and no more than 50.0x.");
 
-  const latestRevenue = latest ? number(latest.revenue, "Latest annual revenue", errors) : null;
+  const latestRevenue = payload.projectionBase ? number(payload.projectionBase.revenue, "Estimated opening revenue", errors)
+    : latest ? number(latest.revenue, "Latest annual revenue", errors) : null;
+  if (latestRevenue !== null && latestRevenue <= 0) errors.push("Opening revenue must be positive; pre-revenue companies require a bespoke model.");
   const latestNwc = latest
     ? [
         latest.accountsReceivable.value,
@@ -224,7 +237,8 @@ export function calculateDcf(
         latest.otherCurrentLiabilities.value,
       ]
     : [];
-  let latestNwcBalance = latestNwc.length && latestNwc.every((value) => value !== null)
+  let latestNwcBalance = payload.projectionBase ? number(payload.projectionBase.netWorkingCapital, "Estimated opening NWC", errors)
+    : latestNwc.length && latestNwc.every((value) => value !== null && Number.isFinite(value))
     ? (latestNwc[0]! + latestNwc[1]! + latestNwc[2]!)
       - (latestNwc[3]! + latestNwc[4]! + latestNwc[5]!)
     : null;
@@ -254,6 +268,9 @@ export function calculateDcf(
   if (wacc !== null && terminalGrowth !== null && wacc <= terminalGrowth) {
     errors.push("WACC must exceed terminal growth.");
   }
+  if (wacc !== null && wacc <= 0) errors.push("WACC must be positive.");
+  if (assumptions.stockCompensationAddBack) warnings.push("SBC is added back: separately model future dilution or cash replacement costs. Existing award dilution alone does not offset perpetual future grants.");
+  if (growth?.some((value) => value > 0.40)) warnings.push("Forecast revenue growth exceeds 40% in at least one year; verify consensus and the growth runway.");
   if (terminalGrowth !== null && payload.market.terminalGdpGrowth.value !== null
     && terminalGrowth > payload.market.terminalGdpGrowth.value) {
     warnings.push("Terminal growth exceeds the sourced long-run nominal GDP benchmark.");
@@ -266,16 +283,13 @@ export function calculateDcf(
     errors.push("Terminal reinvestment cannot exceed 100% of NOPAT in a positive-growth stable state.");
   }
 
-  const canProject = latest && latestRevenue !== null && latestNwcBalance !== null
+  const canProject = validDates && latest && latestRevenue !== null && latestNwcBalance !== null
     && growth && margins && daPercent && sbcPercent && capexPercent && nwcPercent && taxRates
-    && wacc !== null;
+    && wacc !== null && wacc > 0;
   const projections: ProjectionYear[] = [];
   if (canProject) {
-    const nextFiscalEnd = (() => {
-      let candidate = addFiscalYears(latest.period.endDate, 1);
-      while (candidate <= assumptions.valuationDate) candidate = addFiscalYears(candidate, 1);
-      return candidate;
-    })();
+    const nextFiscalEnd = addFiscalYears(baseEnd, 1);
+    if (payload.projectionBase) warnings.push(`Opening revenue and NWC for ${baseEnd} are estimated, not reported financials.`);
     const firstStubFraction = Math.min(1, yearFraction(assumptions.valuationDate, nextFiscalEnd));
     if (firstStubFraction < 0.75) {
       warnings.push(`The first forecast period is a ${(firstStubFraction * 100).toFixed(1)}% stub estimated from a full-year operating case; reconcile reported interim actuals before circulation.`);
@@ -334,6 +348,9 @@ export function calculateDcf(
   }
 
   const finalProjection = projections.at(-1);
+  if (finalProjection && (finalProjection.nopat <= 0 || finalProjection.fullYearUnleveredFreeCashFlow <= 0)) {
+    errors.push("The final forecast year must reach positive NOPAT and free cash flow before applying a perpetuity. Extend the forecast or enter a supported profitability and reinvestment path.");
+  }
   const presentValueExplicitCashFlows = projections.length
     ? projections.reduce((sum, projection) => sum + projection.presentValueOfFreeCashFlow, 0)
     : null;
@@ -356,6 +373,10 @@ export function calculateDcf(
     terminalReinvestmentRate = terminalGrowth / terminalRoic;
     terminalNopat = finalProjection.nopat * (1 + terminalGrowth);
     terminalFreeCashFlow = terminalNopat * (1 - terminalReinvestmentRate);
+    if (finalProjection.fullYearUnleveredFreeCashFlow > 0 && Math.abs(terminalFreeCashFlow / finalProjection.fullYearUnleveredFreeCashFlow - 1) > 0.30) {
+      warnings.push("Terminal free cash flow changes by more than 30% from the final forecast year. Reconcile capex, D&A and working capital to the mature-state ROIC before relying on terminal value.");
+    }
+    if (Math.abs(finalProjection.growth - terminalGrowth) > 0.05) warnings.push("Final forecast growth differs from terminal growth by more than five percentage points; consider a longer transition.");
     terminalValueGordon = terminalFreeCashFlow / (wacc - terminalGrowth);
     const finalEbitda = finalProjection.ebit + finalProjection.depreciationAmortization;
     terminalDiscountPeriod = finalProjection.discountPeriod
@@ -365,7 +386,7 @@ export function calculateDcf(
     enterpriseValueGordon = presentValueExplicitCashFlows + presentValueTerminalGordon;
     terminalValuePctEnterpriseValue = presentValueTerminalGordon / enterpriseValueGordon;
     impliedExitMultiple = finalEbitda !== 0 ? terminalValueGordon / finalEbitda : null;
-    if (exitMultiple !== null) {
+    if (exitMultiple !== null && exitMultiple > 0 && finalEbitda > 0) {
       terminalValueExitMultiple = finalEbitda * exitMultiple;
       presentValueTerminalExit = terminalValueExitMultiple * terminalDiscountFactor;
       enterpriseValueExit = presentValueExplicitCashFlows + presentValueTerminalExit;
@@ -400,6 +421,7 @@ export function calculateDcf(
   };
   const fullyDiluted = fullyDilutedShares(bridge, currentPrice, errors, warnings);
   const completeBridge = Object.values(bridgeValues).every((value) => value !== null);
+  if (bridgeValues.operatingCashRequirement !== null && bridgeValues.cash !== null && bridgeValues.operatingCashRequirement > bridgeValues.cash) errors.push("Operating cash requirement exceeds reported cash; model any funding deficit explicitly.");
   const bridgeAdjustments = completeBridge
     ? bridgeValues.cash! - bridgeValues.operatingCashRequirement! + bridgeValues.shortTermInvestments!
       + bridgeValues.equityMethodInvestments! + bridgeValues.otherNonOperatingAssets!
@@ -422,36 +444,39 @@ export function calculateDcf(
   const upsideDownsideGordon = impliedSharePriceGordon !== null && currentPrice && currentPrice > 0
     ? impliedSharePriceGordon / currentPrice - 1
     : null;
+  if (commonEquityValueGordon !== null && commonEquityValueGordon <= 0) errors.push("Modeled common-equity value is non-positive. Use a distress or restructuring analysis; a negative share price is not an investable equity value.");
+  if (impliedSharePriceGordon !== null && !Number.isFinite(impliedSharePriceGordon)) errors.push("The valuation produced a non-finite output; review input magnitude and discount rates.");
+  const ready = errors.length === 0 && impliedSharePriceGordon !== null;
 
   return {
-    ready: errors.length === 0 && impliedSharePriceGordon !== null,
+    ready,
     errors: [...new Set(errors)],
     warnings: [...new Set(warnings)],
     projections,
     costOfEquity,
     afterTaxCostOfDebt,
     wacc,
-    terminalValueGordon,
-    terminalValueExitMultiple,
-    impliedExitMultiple,
-    impliedPerpetuityGrowth,
-    presentValueExplicitCashFlows,
-    presentValueTerminalGordon,
-    presentValueTerminalExit,
-    enterpriseValueGordon,
-    enterpriseValueExit,
-    terminalValuePctEnterpriseValue,
-    terminalNopat,
-    terminalReinvestmentRate,
-    terminalFreeCashFlow,
-    terminalDiscountPeriod,
-    terminalDiscountFactor,
-    commonEquityValueGordon,
-    commonEquityValueExit,
+    terminalValueGordon: ready ? terminalValueGordon : null,
+    terminalValueExitMultiple: ready ? terminalValueExitMultiple : null,
+    impliedExitMultiple: ready ? impliedExitMultiple : null,
+    impliedPerpetuityGrowth: ready ? impliedPerpetuityGrowth : null,
+    presentValueExplicitCashFlows: ready ? presentValueExplicitCashFlows : null,
+    presentValueTerminalGordon: ready ? presentValueTerminalGordon : null,
+    presentValueTerminalExit: ready ? presentValueTerminalExit : null,
+    enterpriseValueGordon: ready ? enterpriseValueGordon : null,
+    enterpriseValueExit: ready ? enterpriseValueExit : null,
+    terminalValuePctEnterpriseValue: ready ? terminalValuePctEnterpriseValue : null,
+    terminalNopat: ready ? terminalNopat : null,
+    terminalReinvestmentRate: ready ? terminalReinvestmentRate : null,
+    terminalFreeCashFlow: ready ? terminalFreeCashFlow : null,
+    terminalDiscountPeriod: ready ? terminalDiscountPeriod : null,
+    terminalDiscountFactor: ready ? terminalDiscountFactor : null,
+    commonEquityValueGordon: ready ? commonEquityValueGordon : null,
+    commonEquityValueExit: ready ? commonEquityValueExit : null,
     fullyDilutedShares: fullyDiluted,
-    impliedSharePriceGordon,
-    impliedSharePriceExit,
-    upsideDownsideGordon,
+    impliedSharePriceGordon: ready ? impliedSharePriceGordon : null,
+    impliedSharePriceExit: ready ? impliedSharePriceExit : null,
+    upsideDownsideGordon: ready ? upsideDownsideGordon : null,
     bridgeAdjustments,
   };
 }

@@ -198,7 +198,8 @@ export function DcfWorkbench() {
     setLoading(true);
     setRequestError(null);
     try {
-      const response = await fetch(`/api/model?ticker=${encodeURIComponent(symbol)}`);
+      // Version the cache key when changing fiscal-base/schema semantics.
+      const response = await fetch(`/api/model?ticker=${encodeURIComponent(symbol)}&model=2`);
       const body = await response.json() as ModelPayload & { error?: string; refusal?: string };
       if (!response.ok) throw new Error([body.error, body.refusal].filter(Boolean).join(" "));
       setPayload(body);
@@ -381,7 +382,7 @@ export function DcfWorkbench() {
             <div className="review-metrics">
               <div><strong>{money(result.impliedSharePriceGordon, 2)}</strong><span>Gordon value / share</span></div>
               <div><strong>{reviewItems.length}</strong><span>Review items</span></div>
-              <div><strong>{warningItems.length}</strong><span>Source warnings</span></div>
+            <div><strong>{warningItems.length + result.warnings.length}</strong><span>Source / model warnings</span></div>
               <div><strong>{result.errors.length}</strong><span>Critical checks</span></div>
             </div>
             <a href="#audit">Open review queue ↓</a>
@@ -390,7 +391,7 @@ export function DcfWorkbench() {
           {!payload.identity.valuationMethodEligible ? <div className="method-refusal"><strong>FCFF method refused.</strong><p>{payload.identity.ineligibleReason}</p></div> : null}
 
           <section className="model-section" id="historicals">
-            <div className="section-heading"><div><p className="eyebrow">01 · Filing base</p><h2>Historicals with a visible audit trail</h2></div><p>Five fiscal years plus the latest interim where standardized contexts resolve. Values are $mm; available source links open the underlying filing.</p></div>
+            <div className="section-heading"><div><p className="eyebrow">01 · Filing base</p><h2>Historicals with a visible audit trail</h2></div><p>Five fiscal years plus the latest interim where standardized contexts resolve. Values are $mm. Links identify the SEC filing or provider statement; provider data is not independently verified.</p></div>
             <div className="table-shell">
               <table className="financial-table"><thead><tr><th>Fiscal period</th>{annual.map((period) => <th key={period.period.endDate}>{period.period.label}<small>{period.period.endDate}</small></th>)}</tr></thead><tbody>
                 {([
@@ -415,6 +416,7 @@ export function DcfWorkbench() {
                 ["Revenue growth", "revenueGrowth"], ["EBIT margin", "ebitMargin"], ["D&A / revenue", "depreciationAmortizationPctRevenue"], ["SBC / revenue", "stockBasedCompensationPctRevenue"], ["Capex / revenue", "capitalExpendituresPctRevenue"], ["Operating NWC / revenue", "netWorkingCapitalPctRevenue"], ["Operating tax rate", "operatingTaxRate"],
               ] as Array<[string, SeriesKey]>).map(([label, key]) => <div className="assumption-row" key={key}><span>{label}<OriginBadge value={assumptions[key][0]} /></span>{assumptions[key].map((tagged, index) => <input key={index} aria-label={`${label} year ${index + 1}`} type="number" step="0.1" value={tagged.value === null ? "" : (tagged.value * 100).toFixed(2)} placeholder="Enter value" onChange={(event) => updateSeries(key, index, event.target.value === "" ? null : Number(event.target.value) / 100)} />)}</div>)}
             </div>
+            {payload.projectionBase ? <div className="warning-stack"><p>Estimated opening base for {payload.projectionBase.endDate}: revenue {money(payload.projectionBase.revenue.value)}mm. This elapsed fiscal year is not yet reported in the loaded annual statements; it is rolled forward separately so the forecast keeps the correct fiscal-year alignment.</p></div> : null}
             <label htmlFor="sbc-addback" className="toggle-row"><input id="sbc-addback" aria-label="Add stock compensation back to free cash flow" type="checkbox" checked={assumptions.stockCompensationAddBack} onChange={(event) => setAssumptions({ ...assumptions, stockCompensationAddBack: event.target.checked })} /><span><strong>Add stock compensation back to FCF</strong><small>Off by default. SBC remains an economic cost; dilution is handled separately.</small></span></label>
             <div className="table-shell projection-output">
               <table className="financial-table"><thead><tr><th>FCFF build</th>{result.projections.map((year) => <th key={year.endDate}>{year.fiscalYear}E<small>{year.stubFraction < 1 ? `${percent(year.stubFraction, 1)} stub` : year.endDate}</small></th>)}</tr></thead><tbody>

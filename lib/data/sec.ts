@@ -107,6 +107,7 @@ async function fetchJson<T>(url: string): Promise<T> {
   const cached = memoryCache.get(url);
   if (cached && cached.expires > Date.now()) return cached.value as T;
   const response = await fetch(url, {
+    signal: AbortSignal.timeout(15_000),
     headers: {
       "User-Agent": process.env.SEC_USER_AGENT ?? DEFAULT_SEC_USER_AGENT,
       Accept: "application/json",
@@ -142,8 +143,7 @@ function unitsFor(concept: SecConcept, preferred: string[]): [string, SecFact[]]
   for (const unit of preferred) {
     if (concept.units[unit]?.length) return [unit, concept.units[unit]];
   }
-  const first = Object.entries(concept.units)[0];
-  return first ?? null;
+  return null; // Never silently treat a different currency or unit as USD/shares.
 }
 
 function conceptsFor(facts: CompanyFactsResponse, tags: readonly string[]): Array<[string, SecConcept]> {
@@ -166,6 +166,8 @@ function chooseFact(
     for (const fact of entries) {
       if (fact.end !== period.endDate) continue;
       if (duration !== Boolean(fact.start)) continue;
+      if (!Number.isFinite(fact.val)) continue;
+      if (duration && period.startDate && fact.start !== period.startDate) continue;
       if (!["10-K", "10-K/A", "10-Q", "10-Q/A"].includes(fact.form)) continue;
       let score = 0;
       if (fact.accn === period.accessionNumber) score += 10;

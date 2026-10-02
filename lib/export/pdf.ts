@@ -1,5 +1,6 @@
 import { PDFDocument, StandardFonts, rgb, type PDFPage, type PDFFont } from "pdf-lib";
 import type { DcfResult, ModelPayload, ProjectionAssumptions } from "../model/types";
+import { calculateDcf } from "../model/valuation";
 
 const navy = rgb(11 / 255, 31 / 255, 51 / 255);
 const copper = rgb(189 / 255, 106 / 255, 60 / 255);
@@ -71,6 +72,8 @@ function drawFooter(page: PDFPage, regular: PDFFont, pageNumber: number): void {
 }
 
 export async function buildPdf(payload: ModelPayload, assumptions: ProjectionAssumptions, result: DcfResult): Promise<Uint8Array> {
+  result = calculateDcf(payload, assumptions, payload.bridge);
+  if (!result.ready) throw new Error(`Export blocked: ${result.errors.join(" ")}`);
   const document = await PDFDocument.create();
   document.setTitle(`${payload.identity.ticker} Banker Ready DCF`);
   document.setAuthor("Banker Ready DCF");
@@ -146,7 +149,7 @@ export async function buildPdf(payload: ModelPayload, assumptions: ProjectionAss
     wrapText(check, regular, 7, 300).slice(0, 2).forEach((line, lineIndex) => auditPage.drawText(line, { x: 448, y: y - lineIndex * 10, font: regular, size: 7, color: navy }));
   });
   drawSection(auditPage, bold, "Priority review flags - complete queue follows", 412, 356, 346);
-  const gaps = payload.gaps.filter((gap) => gap.severity !== "blocking");
+  const gaps = [...payload.gaps.filter((gap) => gap.severity !== "blocking"), ...result.warnings.map((reason) => ({ field: "Model review", reason, severity: "warning", affectedOutputs: ["DCF"] }))];
   let y = 333;
   for (const gap of gaps.slice(0, 8)) {
     if (y < 56) break;
@@ -158,27 +161,32 @@ export async function buildPdf(payload: ModelPayload, assumptions: ProjectionAss
   if (!gaps.length) auditPage.drawText("No review or source-warning items were reported.", { x: 412, y: 332, font: regular, size: 7, color: navy });
   drawFooter(auditPage, regular, 2);
 
-  const queuePage = document.addPage([792, 612]);
-  drawHeader(queuePage, bold, regular, "COMPLETE REVIEW QUEUE", `${payload.identity.ticker} | Every unresolved source, assumption and judgment flag`);
-  {
+  let pageNumber = 2;
+  const newQueuePage = () => {
+    const queuePage = document.addPage([792, 612]);
+    drawHeader(queuePage, bold, regular, "COMPLETE REVIEW QUEUE", `${payload.identity.ticker} | Every unresolved source, assumption and judgment flag`);
     queuePage.drawRectangle({ x: 34, y: 522, width: 724, height: 19, color: navy });
     queuePage.drawText("SEVERITY", { x: 42, y: 529, font: bold, size: 6.5, color: white });
     queuePage.drawText("ITEM AND REQUIRED REVIEW", { x: 105, y: 529, font: bold, size: 6.5, color: white });
     queuePage.drawText("AFFECTED OUTPUTS", { x: 625, y: 529, font: bold, size: 6.5, color: white });
-  }
+    drawFooter(queuePage, regular, ++pageNumber);
+    return queuePage;
+  };
+  let queuePage = newQueuePage();
   let queueY = 507;
   gaps.forEach((gap, index) => {
+    const lines = wrapText(`${gap.field}: ${gap.reason}`, regular, 8, 495);
+    const affected = wrapText(gap.affectedOutputs.join(", "), regular, 7.5, 122);
+    const height = Math.max(32, Math.max(lines.length, affected.length) * 10 + 13);
+    if (queueY - height < 48) { queuePage = newQueuePage(); queueY = 507; }
     const background = index % 2 === 0 ? paper : white;
-    queuePage.drawRectangle({ x: 34, y: queueY - 23, width: 724, height: 29, color: background });
+    queuePage.drawRectangle({ x: 34, y: queueY - height + 9, width: 724, height: height - 1, color: background });
     queuePage.drawText(gap.severity.toUpperCase(), { x: 42, y: queueY, font: bold, size: 6.2, color: gap.severity === "review" ? amber : muted });
-    const lines = wrapText(`${gap.field}: ${gap.reason}`, regular, 6.2, 500).slice(0, 2);
-    lines.forEach((line, lineIndex) => queuePage.drawText(line, { x: 105, y: queueY - lineIndex * 8, font: regular, size: 6.2, color: navy }));
-    const affected = fitText(gap.affectedOutputs.join(", "), regular, 6.1, 122);
-    queuePage.drawText(affected, { x: 625, y: queueY, font: regular, size: 6.1, color: muted });
-    queueY -= 30;
+    lines.forEach((line, lineIndex) => queuePage.drawText(line, { x: 105, y: queueY - lineIndex * 10, font: regular, size: 8, color: navy }));
+    affected.forEach((line, lineIndex) => queuePage.drawText(line, { x: 625, y: queueY - lineIndex * 10, font: regular, size: 7.5, color: muted }));
+    queueY -= height;
   });
   queuePage.drawText("Calculation completion confirms arithmetic integrity only. A deal-team reviewer must clear each item before circulation.", { x: 34, y: 42, font: bold, size: 7, color: amber });
-  drawFooter(queuePage, regular, 3);
   return document.save();
 }
 

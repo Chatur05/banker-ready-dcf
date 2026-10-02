@@ -18,12 +18,14 @@ export async function GET(request: Request) {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "The data source returned an unknown error.";
+    const unsupported = message.startsWith("Unsupported");
     return Response.json(
       {
         error: message,
-        refusal: "No valuation was produced because the required source data could not be retrieved and verified.",
+        refusal: unsupported ? "No consolidated FCFF share price was produced. A tailored model is required for this issuer."
+          : "No valuation was produced because required financial statements could not be retrieved with sufficient coverage.",
       },
-      { status: 502 },
+      { status: unsupported ? 422 : 502 },
     );
   }
 }

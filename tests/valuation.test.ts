@@ -4,7 +4,8 @@ import ExcelJS from "exceljs";
 import { PDFDocument } from "pdf-lib";
 import { loadFmpFundamentals } from "../lib/data/fmp-fundamentals";
 import { fetchFmp } from "../lib/data/fmp";
-import { buildModelPayload } from "../lib/data/model";
+import { buildModelPayload, operatingForecast } from "../lib/data/model";
+import { numeric } from "../lib/data/numeric";
 import { buildExcelWorkbook } from "../lib/export/excel-xml";
 import { buildPdf } from "../lib/export/pdf";
 import type { ModelPayload, TaggedValue } from "../lib/model/types";
@@ -206,7 +207,7 @@ test("exports are genuine, review-controlled Office files and preserve the edite
   assert.ok(valuation);
   assert.ok(assumptions);
   assert.equal(workbook.worksheets.length, 9);
-  assert.equal(valuation.getCell("B44").value && typeof valuation.getCell("B44").value === "object" ? (valuation.getCell("B44").value as ExcelJS.CellFormulaValue).formula : null, "B37/B43");
+  assert.match((valuation.getCell("B44").value as ExcelJS.CellFormulaValue).formula, /B37\/B43/);
   const cashRow = assumptions.getColumn(1).values.findIndex((value) => value === "Cash and equivalents");
   assert.ok(cashRow > 0);
   assert.equal(assumptions.getCell(cashRow, 2).value, 777);
@@ -226,6 +227,7 @@ test("automatic FMP fallback produces a complete review-ready valuation", async 
   const annualDates = ["2021-12-31", "2022-12-31", "2023-12-31", "2024-12-31", "2025-12-31"];
   const annualIncome = annualDates.map((date, index) => ({
     date,
+    reportedCurrency: "USD",
     fiscalYear: 2021 + index,
     period: "FY",
     revenue: (800 + index * 50) * 1_000_000,
@@ -238,6 +240,7 @@ test("automatic FMP fallback produces a complete review-ready valuation", async 
   }));
   const annualBalance = annualDates.map((date, index) => ({
     date,
+    reportedCurrency: "USD",
     cashAndCashEquivalents: (80 + index * 5) * 1_000_000,
     shortTermInvestments: 20_000_000,
     shortTermDebt: 10_000_000,
@@ -254,6 +257,7 @@ test("automatic FMP fallback produces a complete review-ready valuation", async 
   }));
   const annualCash = annualDates.map((date) => ({
     date,
+    reportedCurrency: "USD",
     depreciationAndAmortization: 30_000_000,
     stockBasedCompensation: 10_000_000,
     capitalExpenditure: -40_000_000,
@@ -337,11 +341,11 @@ test("FMP fallback stays within the five-period statement entitlement", async ()
     if (url.pathname.endsWith("/profile")) {
       payload = [{ companyName: "Test Company", sector: "Technology", industry: "Software" }];
     } else if (annual && url.pathname.endsWith("/income-statement")) {
-      payload = [{ date: "2025-06-30", fiscalYear: 2025, period: "FY", revenue: 100_000_000, operatingIncome: 20_000_000 }];
+      payload = [{ date: "2025-06-30", reportedCurrency: "USD", fiscalYear: 2025, period: "FY", revenue: 100_000_000, operatingIncome: 20_000_000 }];
     } else if (annual && url.pathname.endsWith("/balance-sheet-statement")) {
-      payload = [{ date: "2025-06-30", cashAndCashEquivalents: 10_000_000, totalStockholdersEquity: 50_000_000 }];
+      payload = [{ date: "2025-06-30", reportedCurrency: "USD", shortTermDebt: 0, longTermDebt: 0, cashAndCashEquivalents: 10_000_000, totalStockholdersEquity: 50_000_000 }];
     } else if (annual && url.pathname.endsWith("/cash-flow-statement")) {
-      payload = [{ date: "2025-06-30", depreciationAndAmortization: 5_000_000, capitalExpenditure: -4_000_000 }];
+      payload = [{ date: "2025-06-30", reportedCurrency: "USD", depreciationAndAmortization: 5_000_000, capitalExpenditure: -4_000_000 }];
     }
     return new Response(JSON.stringify(payload), {
       status: 200,
@@ -439,4 +443,179 @@ test("a genuine rate-limit circuit is short-lived and isolated to the exact requ
     if (originalKey === undefined) delete process.env.FMP_API_KEY;
     else process.env.FMP_API_KEY = originalKey;
   }
+});
+
+test("provider nulls, blank strings and booleans never become reported zeros", () => {
+  for (const value of [null, undefined, "", "  ", false, true, [], {}, "NaN", Infinity]) assert.equal(numeric({ value }, ["value"]), null);
+  assert.equal(numeric({ value: 0 }, ["value"]), 0);
+  assert.equal(numeric({ value: "0" }, ["value"]), 0);
+  assert.equal(numeric({ a: null, b: 7 }, ["a", "b"]), 7);
+});
+
+test("consensus matches fiscal dates, accepts high growth and never shifts a missing year", () => {
+  const latest = reviewReadyFixture().historicals.annual.at(-1)!;
+  latest.revenue = tagged(100);
+  const estimates = [
+    { fiscalDate: "2026-12-31", revenue: 190, ebit: 57, revenueAnalystCount: 10, sourceUrl: "https://example.com/2026" },
+    { fiscalDate: "2028-12-31", revenue: 260, ebit: 78, revenueAnalystCount: 10, sourceUrl: "https://example.com/2028" },
+  ];
+  const forecast = operatingForecast(latest, estimates, 5, 0.15, 0.20, 0.025);
+  assert.ok(Math.abs(forecast.revenueGrowth[0].value! - 0.90) < 1e-12);
+  assert.notEqual(forecast.revenueGrowth[1].provenance.sourceUrl?.includes("2028"), true);
+  assert.equal(forecast.revenueGrowth[2].provenance.asOf, "2028-12-31");
+  const yearThreeRevenue = forecast.revenueGrowth.slice(0, 3).reduce((revenue, growth) => revenue * (1 + growth.value!), 100);
+  assert.ok(Math.abs(yearThreeRevenue - 260) < 1e-9);
+  const rejected = operatingForecast(latest, [{ ...estimates[0], revenue: 500 }], 5, 0.15, 0.20, 0.025);
+  assert.ok(rejected.revenueGrowth.every((item) => item.value! <= 0.15 && item.value! >= 0.03));
+});
+
+test("estimated elapsed-year base rolls revenue forward without relabeling last year's growth", () => {
+  const payload = reviewReadyFixture();
+  payload.projectionBase = { endDate: "2026-12-31", revenue: tagged(2000), netWorkingCapital: tagged(200) };
+  payload.assumptions.valuationDate = "2027-01-05";
+  const result = calculateDcf(payload);
+  assert.equal(result.ready, true);
+  assert.equal(result.projections[0].endDate, "2027-12-31");
+  assert.equal(result.projections[0].revenue, 2100);
+  assert.equal(result.projections[0].changeInNetWorkingCapital, 10);
+  assert.match(result.warnings.join(" "), /estimated, not reported/);
+});
+
+test("invalid cases suppress all headline values, not only the ready flag", async () => {
+  for (const mutation of [
+    (p: ModelPayload) => { p.identity.valuationMethodEligible = false; },
+    (p: ModelPayload) => { p.bridge.debt = tagged(null); },
+    (p: ModelPayload) => { p.bridge.debt = tagged(-1); },
+    (p: ModelPayload) => { p.assumptions.ebitMargin = p.assumptions.ebitMargin.map(() => tagged(-0.2)); },
+    (p: ModelPayload) => { p.assumptions.projectionYears = 5.5; },
+    (p: ModelPayload) => { p.assumptions.projectionYears = Infinity; },
+    (p: ModelPayload) => { p.assumptions.valuationDate = "2026-02-30"; },
+    (p: ModelPayload) => { p.assumptions.valuationDate = "2027-08-09"; },
+    (p: ModelPayload) => { p.bridge.basicShares = tagged(0); },
+    (p: ModelPayload) => { p.assumptions.terminalGrowth = tagged(0.2); },
+  ]) {
+    const payload = reviewReadyFixture(); mutation(payload);
+    const result = calculateDcf(payload);
+    assert.equal(result.ready, false);
+    for (const key of ["impliedSharePriceGordon", "impliedSharePriceExit", "enterpriseValueGordon", "commonEquityValueGordon", "upsideDownsideGordon"] as const) assert.equal(result[key], null, key);
+    await assert.rejects(buildExcelWorkbook(payload, payload.assumptions, payload.bridge, result), /Export blocked/);
+    await assert.rejects(buildPdf(payload, payload.assumptions, result), /Export blocked/);
+  }
+});
+
+test("negative terminal cash flow cannot be rescued by an abrupt perpetuity assumption", () => {
+  const payload = reviewReadyFixture();
+  payload.assumptions.capitalExpendituresPctRevenue = payload.assumptions.capitalExpendituresPctRevenue.map(() => tagged(0.5));
+  const result = calculateDcf(payload);
+  assert.equal(result.ready, false);
+  assert.match(result.errors.join(" "), /positive NOPAT and free cash flow/);
+  assert.equal(result.impliedSharePriceGordon, null);
+});
+
+test("workbook residual weights, sensitivity axes, ROIC and opening base stay formula linked", async () => {
+  const payload = reviewReadyFixture();
+  payload.projectionBase = { endDate: "2026-12-31", revenue: tagged(2000), netWorkingCapital: tagged(200) };
+  payload.assumptions.valuationDate = "2027-01-05";
+  const result = calculateDcf(payload);
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(Buffer.from(await buildExcelWorkbook(payload, payload.assumptions, payload.bridge, result)) as unknown as Parameters<typeof workbook.xlsx.load>[0]);
+  const input = workbook.getWorksheet("Assumptions")!;
+  const equityRow = input.getColumn(1).values.findIndex((value) => value === "Equity weight");
+  assert.match((input.getCell(equityRow, 2).value as ExcelJS.CellFormulaValue).formula, /^1-B\d+-B\d+$/);
+  assert.match((workbook.getWorksheet("Sensitivities")!.getCell("D7").value as ExcelJS.CellFormulaValue).formula, /'Valuation Summary'!\$B\$6/);
+  assert.match((workbook.getWorksheet("Sensitivities")!.getCell("D4").value as ExcelJS.CellFormulaValue).formula, /\$B\$10/);
+  assert.equal(workbook.getWorksheet("Historicals")!.getCell("B25").value, 2000);
+  assert.match((workbook.getWorksheet("Projection Model")!.getCell("B6").value as ExcelJS.CellFormulaValue).formula, /\$B\$25/);
+  assert.match((workbook.getWorksheet("Checks")!.getCell("E7").value as ExcelJS.CellFormulaValue).formula, /IF/);
+});
+
+test("large PDF review queues paginate rather than truncating or running below the page", async () => {
+  const payload = reviewReadyFixture();
+  payload.gaps = Array.from({ length: 60 }, (_, index) => ({ field: `Review ${index + 1}`, reason: "An assumption requiring a complete explanation. ".repeat(8), severity: "review", affectedOutputs: ["DCF", "Per-share value"] }));
+  const result = calculateDcf(payload);
+  const pdf = await PDFDocument.load(await buildPdf(payload, payload.assumptions, result));
+  assert.ok(pdf.getPageCount() > 8);
+});
+
+test("FMP HTTP-200 errors are not cached as financial data and key rotation isolates cache", async () => {
+  const originalFetch = globalThis.fetch; const originalKey = process.env.FMP_API_KEY;
+  let calls = 0;
+  process.env.FMP_API_KEY = "cache-scope-one";
+  globalThis.fetch = async () => {
+    calls++;
+    return new Response(JSON.stringify(calls === 1 ? { "Error Message": "Invalid API key" } : [{ calls }]));
+  };
+  try {
+    await assert.rejects(fetchFmp("/audit-errors", { symbol: "TEST" }), /error payload/);
+    assert.equal((await fetchFmp<Array<{ calls: number }>>("/audit-errors", { symbol: "TEST" }))[0].calls, 2);
+    await fetchFmp("/audit-errors", { symbol: "TEST" }); assert.equal(calls, 2);
+    process.env.FMP_API_KEY = "cache-scope-two";
+    await fetchFmp("/audit-errors", { symbol: "TEST" }); assert.equal(calls, 3);
+  } finally { globalThis.fetch = originalFetch; if (originalKey === undefined) delete process.env.FMP_API_KEY; else process.env.FMP_API_KEY = originalKey; }
+});
+
+test("long provider Retry-After is respected without repeated requests", async () => {
+  const originalFetch = globalThis.fetch; const originalKey = process.env.FMP_API_KEY;
+  let calls = 0; process.env.FMP_API_KEY = "long-backoff-test";
+  globalThis.fetch = async () => { calls++; return new Response("Too many requests", { status: 429, headers: { "Retry-After": "120" } }); };
+  try {
+    await assert.rejects(fetchFmp("/audit-backoff"), /429/);
+    await assert.rejects(fetchFmp("/audit-backoff"), /retry in 1\d\d seconds/);
+    assert.equal(calls, 1);
+  } finally { globalThis.fetch = originalFetch; if (originalKey === undefined) delete process.env.FMP_API_KEY; else process.env.FMP_API_KEY = originalKey; }
+});
+
+test("source normalization retains tax benefits, all current accruals, dates and complete debt", async () => {
+  const originalFetch = globalThis.fetch; const originalKey = process.env.FMP_API_KEY;
+  const profile = [{ companyName: "Source Test", sector: "Technology", currency: "USD" }];
+  const income = { date: "2025-12-31", filingDate: "2026-02-01", reportedCurrency: "USD", period: "FY", revenue: 1e9, operatingIncome: 2e8, incomeTaxExpense: -1e7 };
+  const balance = { ...income, totalCurrentLiabilities: 3e8, accountPayables: 1e8, deferredRevenue: 2e7, shortTermDebt: 3e7, longTermDebt: 4e7, capitalLeaseObligationsCurrent: 5e6, otherCurrentLiabilities: 4e7, cashAndCashEquivalents: 1e8 };
+  const cash = { ...income, depreciationAndAmortization: 3e7, capitalExpenditure: -4e7 };
+  const records = { income, balance, cash };
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    const payload = url.pathname.endsWith("/profile") ? profile : url.searchParams.get("period") === "quarter" ? []
+      : url.pathname.endsWith("/income-statement") ? [records.income, records.income]
+        : url.pathname.endsWith("/balance-sheet-statement") ? [records.balance] : [records.cash];
+    return new Response(JSON.stringify(payload));
+  };
+  try {
+    process.env.FMP_API_KEY = "normalization-valid";
+    const bundle = await loadFmpFundamentals("SOURCE");
+    assert.equal(bundle.historicals.annual.length, 1);
+    const period = bundle.historicals.annual[0];
+    assert.equal(period.incomeTaxExpense.value, -10);
+    assert.equal(period.totalDebt.value, 70);
+    assert.equal(period.otherCurrentLiabilities.value, 145);
+    assert.equal(period.period.filingDate, "2026-02-01");
+    assert.equal(period.period.accessionNumber, "");
+    assert.match(period.revenue.provenance.sourceUrl!, /symbol=SOURCE/);
+    process.env.FMP_API_KEY = "normalization-missing-debt";
+    Object.assign(records.balance, { longTermDebt: null });
+    await assert.rejects(loadFmpFundamentals("SOURCE"), /Missing required totalDebt/);
+    Object.assign(records.balance, { longTermDebt: 4e7 });
+    process.env.FMP_API_KEY = "normalization-currency";
+    records.cash.reportedCurrency = "EUR";
+    await assert.rejects(loadFmpFundamentals("SOURCE"), /Statement currency.*EUR/);
+    records.cash.reportedCurrency = "USD";
+    process.env.FMP_API_KEY = "normalization-missing-capex";
+    Object.assign(records.cash, { capitalExpenditure: null });
+    await assert.rejects(loadFmpFundamentals("SOURCE"), /Missing required capitalExpenditures/);
+  } finally { globalThis.fetch = originalFetch; if (originalKey === undefined) delete process.env.FMP_API_KEY; else process.env.FMP_API_KEY = originalKey; }
+});
+
+test("unsupported financial and captive-finance issuers stop before statement requests", async () => {
+  const originalFetch = globalThis.fetch; const originalKey = process.env.FMP_API_KEY;
+  const requests: string[] = [];
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input)); requests.push(url.pathname);
+    const symbol = url.searchParams.get("symbol");
+    return new Response(JSON.stringify([{ sector: symbol === "JPM" ? "Financial Services" : "Consumer Cyclical", industry: symbol === "O" ? "REIT" : "Auto Manufacturers", currency: "USD" }]));
+  };
+  try {
+    process.env.FMP_API_KEY = "sector-restrictions-test";
+    for (const ticker of ["F", "GM", "JPM", "O"]) await assert.rejects(loadFmpFundamentals(ticker), /Unsupported/);
+    assert.equal(requests.length, 4);
+    assert.ok(requests.every((path) => path.endsWith("/profile")));
+  } finally { globalThis.fetch = originalFetch; if (originalKey === undefined) delete process.env.FMP_API_KEY; else process.env.FMP_API_KEY = originalKey; }
 });
